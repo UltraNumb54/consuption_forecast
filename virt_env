@@ -1,0 +1,120 @@
+## 🐍 Создание виртуальной среды для проекта
+
+### 📋 Что нужно установить
+
+```bash
+# Версия Python: 3.8 - 3.11 (рекомендую 3.9 или 3.10)
+# Библиотеки:
+- pandas
+- numpy
+- matplotlib
+- seaborn
+- scikit-learn
+- lightgbm
+- jupyter (опционально для анализа)
+```
+
+---
+
+## 🛠️ Создание виртуальной среды через командную строку
+
+```bash
+# 1. Создать папку проекта
+mkdir energy_forecast_project
+cd energy_forecast_project
+
+# 2. Создать виртуальную среду
+python -m venv energy_env
+
+# 3. Активировать среду
+# Windows:
+energy_env\Scripts\activate
+# Linux/Mac:
+# source energy_env/bin/activate
+
+# 4. Установить зависимости
+pip install pandas numpy matplotlib seaborn scikit-learn lightgbm jupyter
+
+# 5. Сохранить зависимости (опционально)
+pip freeze > requirements.txt
+
+# 6. Деактивировать среду (когда закончили)
+deactivate
+```
+
+---
+
+## 🖥️ Настройка в PyCharm
+
+### 1. **Открыть проект в PyCharm**
+
+### 2. **Настроить интерпретатор:**
+```
+File → Settings → Project → Python Interpreter
+→ Нажать шестерёнку → Add → Existing Environment
+→ Указать путь к python.exe в папке venv:
+Windows: energy_forecast_project\energy_env\Scripts\python.exe
+Linux/Mac: energy_forecast_project/energy_env/bin/python
+```
+
+### 3. **Проверить установку библиотек:**
+В консоли PyCharm выполнить:
+```python
+import pandas as pd
+import lightgbm as lgb
+print("Все библиотеки установлены!")
+```
+
+---
+
+## 🔄 Работа с несколькими проектами/средами
+
+### 📁 Структура проектов:
+```
+projects/
+├── energy_forecast/
+│   ├── energy_env/          # виртуальная среда для энергетики
+│   ├── data/
+│   └── forecast_code.py
+├── another_project/
+│   ├── another_env/         # другая виртуальная среда
+│   └── code.py
+```
+
+### 🔁 Переключение между средами:
+1. **В PyCharm**: 
+   - `File → Settings → Project → Python Interpreter`
+   - Выбрать нужную среду из списка или добавить новую
+
+2. **В терминале**:
+   ```bash
+   # Активировать нужную среду
+   energy_forecast\energy_env\Scripts\activate
+   
+   # Работать в ней
+   python forecast_code.py
+   
+   # Деактивировать
+   deactivate
+   
+   # Активировать другую
+   another_project\another_env\Scripts\activate
+   ```
+  
+## 📋 requirements.txt для проекта
+
+Создай файл `requirements.txt`:
+```
+pandas==1.5.3
+numpy==1.24.3
+matplotlib==3.7.1
+seaborn==0.12.2
+scikit-learn==1.3.0
+lightgbm==3.3.5
+jupyter==1.0.0
+```
+
+Установка из файла:
+```bash
+pip install -r requirements.txt
+```
