@@ -1,0 +1,171 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from catboost import CatBoostRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_absolute_error, mean_absolute_percentage_error
+import joblib
+
+# === КОНСТАНТЫ ===
+TRAINING_DATA_FILE = 'filtered_training_data.csv'  # Файл с отфильтрованными данными
+MODEL_SAVE_PATH = 'energy_forecast_model.cbm'      # Путь для сохранения модели
+FEATURES_IMPORTANCE_PATH = 'features_importance.png'  # График важности признаков
+EVALUATION_PLOT_PATH = 'model_evaluation.png'      # График оценки модели
+
+# === ПАРАМЕТРЫ МОДЕЛИ ===
+RANDOM_STATE = 42
+TEST_SIZE = 0.2
+TARGET_COLUMN = 'consumption'
+
+def prepare_features_and_target(df):
+    """Подготовка признаков и целевой переменной"""
+    print("=== ПОДГОТОВКА ПРИЗНАКОВ ===")
+    
+    # Определяем признаки для модели
+    numerical_features = [
+        'hour', 'dayofweek', 'month',
+        'temperature', 'humidity', 'wind_speed',
+        'consumption_lag_1', 'consumption_lag_2', 'consumption_lag_3',
+        'consumption_lag_24', 'consumption_lag_48', 'consumption_lag_168',
+        'consumption_rolling_mean_3', 'consumption_rolling_mean_6',
+        'consumption_rolling_mean_12', 'consumption_rolling_mean_24',
+        'consumption_rolling_std_3', 'consumption_rolling_std_6',
+        'consumption_rolling_std_12', 'consumption_rolling_std_24'
+    ]
+    
+    categorical_features = [
+        'is_holiday', 'is_working_weekend', 'is_regular_weekend',
+        'is_working_day', 'is_weekend_or_holiday', 'is_weekend'
+    ]
+    
+    # Проверяем наличие признаков
+    available_numerical = [col for col in numerical_features if col in df.columns]
+    available_categorical = [col for col in categorical_features if col in df.columns]
+    
+    print(f"Числовые признаки ({len(available_numerical)}): {available_numerical}")
+    print(f"Категориальные признаки ({len(available_categorical)}): {available_categorical}")
+    
+    # Формируем финальный список признаков
+    feature_columns = available_numerical + available_categorical
+    target_column = TARGET_COLUMN
+    
+    # Удаляем строки с пропусками в признаках
+    df_features = df[feature_columns + [target_column]].dropna()
+    
+    X = df_features[feature_columns]
+    y = df_features[target_column]
+    
+    print(f"Форма данных для обучения: X={X.shape}, y={y.shape}")
+    
+    return X, y, feature_columns, available_categorical
+
+def train_model():
+    """Обучение модели CatBoost"""
+    print("=== ОБУЧЕНИЕ МОДЕЛИ CATBOOST ===")
+    
+    # Загрузка данных
+    df = pd.read_csv(TRAINING_DATA_FILE)
+    df['datetime'] = pd.to_datetime(df['datetime'])
+    
+    print(f"Загружено данных: {len(df)} записей")
+    
+    # Подготовка признаков
+    X, y, feature_columns, categorical_features = prepare_features_and_target(df)
+    
+    # Разделение на train/test
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, shuffle=False  # Важно: без перемешивания для временных рядов
+    )
+    
+    print(f"Размер обучающей выборки: {len(X_train)}")
+    print(f"Размер тестовой выборки: {len(X_test)}")
+    
+    # Создание и обучение модели
+    model = CatBoostRegressor(
+        iterations=1000,
+        learning_rate=0.1,
+        depth=6,
+        loss_function='MAE',
+        eval_metric='MAE',
+        random_seed=42,
+        verbose=100,
+        early_stopping_rounds=50,
+        task_type='CPU'  # Явно указываем CPU
+    )
+    
+    print("Начало обучения...")
+    model.fit(
+        X_train, y_train,
+        cat_features=categorical_features,
+        eval_set=(X_test, y_test),
+        use_best_model=True
+    )
+    
+    # Предсказания
+    y_pred_train = model.predict(X_train)
+    y_pred_test = model.predict(X_test)
+    
+    # Оценка качества
+    mae_train = mean_absolute_error(y_train, y_pred_train)
+    mae_test = mean_absolute_error(y_test, y_pred_test)
+    mape_test = mean_absolute_percentage_error(y_test, y_pred_test) * 100
+    
+    print(f"\n=== РЕЗУЛЬТАТЫ ОБУЧЕНИЯ ===")
+    print(f"MAE на обучении: {mae_train:.3f}")
+    print(f"MAE на тесте: {mae_test:.3f}")
+    print(f"MAPE на тесте: {mape_test:.2f}%")
+    print(f"Точность (±2.5% от среднего): {mae_test < (y_test.mean() * 0.025):.1%}")
+    
+    # Сохранение модели
+    model.save_model(MODEL_SAVE_PATH)
+    print(f"Модель сохранена в {MODEL_SAVE_PATH}")
+    
+    # Важность признаков
+    feature_importance = pd.DataFrame({
+        'feature': feature_columns,
+        'importance': model.get_feature_importance()
+    }).sort_values('importance', ascending=False)
+    
+    plt.figure(figsize=(10, 8))
+    top_features = feature_importance.head(15)
+    plt.barh(range(len(top_features)), top_features['importance'])
+    plt.yticks(range(len(top_features)), top_features['feature'])
+    plt.xlabel('Важность признаков')
+    plt.title('Топ-15 самых важных признаков')
+    plt.gca().invert_yaxis()
+    plt.tight_layout()
+    plt.savefig(FEATURES_IMPORTANCE_PATH, dpi=300)
+    plt.show()
+    
+    # График оценки
+    plt.figure(figsize=(15, 6))
+    
+    # Ограничиваем для визуализации (первые 1000 точек)
+    sample_size = min(1000, len(y_test))
+    indices = np.random.choice(len(y_test), sample_size, replace=False) if len(y_test) > sample_size else slice(None)
+    
+    plt.scatter(y_test.iloc[indices], y_pred_test[indices], alpha=0.5)
+    plt.plot([y_test.min(), y_test.max()], [y_test.min(), y_test.max()], 'r--', lw=2)
+    plt.xlabel('Реальное значение')
+    plt.ylabel('Предсказанное значение')
+    plt.title(f'Оценка модели (MAE={mae_test:.3f})')
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(EVALUATION_PLOT_PATH, dpi=300)
+    plt.show()
+    
+    return model, feature_columns, categorical_features
+
+def main():
+    """Основная функция обучения"""
+    print("=== НАЧАЛО ОБУЧЕНИЯ МОДЕЛИ ===")
+    try:
+        model, features, categorical = train_model()
+        print("=== ОБУЧЕНИЕ ЗАВЕРШЕНО УСПЕШНО ===")
+        print(f"Использованные признаки: {len(features)}")
+        print(f"Категориальные признаки: {len(categorical)}")
+    except Exception as e:
+        print(f"Ошибка при обучении: {e}")
+
+if __name__ == "__main__":
+    main()
