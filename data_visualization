@@ -1,0 +1,192 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+
+# === КОНСТАНТЫ ===
+PROCESSED_DATA_FILE = 'processed_energy_data.csv'  # Файл с предобработанными данными
+VISUALIZATIONS_FOLDER = 'visualizations/'          # Папка для сохранения графиков
+
+def create_visualizations_folder():
+    """Создание папки для визуализаций"""
+    import os
+    if not os.path.exists(VISUALIZATIONS_FOLDER):
+        os.makedirs(VISUALIZATIONS_FOLDER)
+
+def load_data():
+    """Загрузка предобработанных данных"""
+    print("Загрузка предобработанных данных...")
+    try:
+        df = pd.read_csv(PROCESSED_DATA_FILE)
+        df['datetime'] = pd.to_datetime(df['datetime'])
+        print(f"Данные загружены. Размер: {len(df)} строк")
+        return df
+    except FileNotFoundError:
+        print(f"Ошибка: Файл {PROCESSED_DATA_FILE} не найден!")
+        print("Пожалуйста, сначала запустите data_preprocessing.py")
+        return None
+
+def plot_consumption_trend(df):
+    """График общей динамики потребления"""
+    plt.figure(figsize=(15, 6))
+    df.set_index('datetime')['consumption'].plot(alpha=0.7, linewidth=0.8)
+    plt.title('Динамика потребления по часам')
+    plt.ylabel('Потребление')
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(f'{VISUALIZATIONS_FOLDER}consumption_trend.png', dpi=300, bbox_inches='tight')
+    plt.show()
+
+def plot_hourly_profile(df):
+    """Суточный профиль потребления"""
+    hourly_profile = df.groupby('hour')['consumption'].mean()
+    plt.figure(figsize=(12, 5))
+    hourly_profile.plot(kind='bar', color='skyblue')
+    plt.title('Среднее потребление по часам суток')
+    plt.ylabel('Потребление')
+    plt.xlabel('Час')
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(f'{VISUALIZATIONS_FOLDER}hourly_profile.png', dpi=300, bbox_inches='tight')
+    plt.show()
+
+def plot_weekday_profile(df):
+    """Потребление по дням недели"""
+    weekday_profile = df.groupby('dayofweek')['consumption'].mean()
+    plt.figure(figsize=(10, 5))
+    weekday_profile.plot(kind='bar', color='lightcoral')
+    plt.title('Среднее потребление по дням недели')
+    plt.ylabel('Потребление')
+    plt.xlabel('День недели (0=Пн, 6=Вс)')
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(f'{VISUALIZATIONS_FOLDER}weekday_profile.png', dpi=300, bbox_inches='tight')
+    plt.show()
+
+def plot_temperature_dependency(df):
+    """Зависимость потребления от температуры"""
+    plt.figure(figsize=(12, 6))
+    plt.scatter(df['temperature'], df['consumption'], alpha=0.3, s=1, color='green')
+    plt.xlabel('Температура (°C)')
+    plt.ylabel('Потребление')
+    plt.title('Зависимость потребления от температуры')
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(f'{VISUALIZATIONS_FOLDER}temperature_dependency.png', dpi=300, bbox_inches='tight')
+    plt.show()
+
+def plot_daytype_consumption(df):
+    """Потребление по типам дней"""
+    plt.figure(figsize=(12, 6))
+    day_types = df.groupby('day_type')['consumption'].mean().sort_values(ascending=False)
+    day_types.plot(kind='bar', color=['red', 'orange', 'blue', 'green'])
+    plt.title('Среднее потребление по типам дней')
+    plt.ylabel('Потребление')
+    plt.xticks(rotation=45)
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(f'{VISUALIZATIONS_FOLDER}daytype_consumption.png', dpi=300, bbox_inches='tight')
+    plt.show()
+
+def plot_heatmap_hour_daytype(df):
+    """Тепловая карта: часы vs типы дней"""
+    plt.figure(figsize=(15, 10))
+    pivot_heatmap = df.pivot_table(
+        values='consumption', 
+        index='hour', 
+        columns='day_type', 
+        aggfunc='mean'
+    )
+    sns.heatmap(pivot_heatmap, annot=True, fmt='.0f', cmap='YlOrRd')
+    plt.title('Тепловая карта потребления: часы vs типы дней')
+    plt.tight_layout()
+    plt.savefig(f'{VISUALIZATIONS_FOLDER}heatmap_hour_daytype.png', dpi=300, bbox_inches='tight')
+    plt.show()
+
+def plot_holiday_vs_working(df):
+    """Сравнение праздников и рабочих дней"""
+    plt.figure(figsize=(15, 6))
+    
+    holiday_consumption = df[df['is_holiday'] == 1].groupby(df['datetime'].dt.hour)['consumption'].mean()
+    working_consumption = df[df['is_working_day'] == 1].groupby(df['datetime'].dt.hour)['consumption'].mean()
+    
+    plt.plot(holiday_consumption.index, holiday_consumption.values, 
+             label='Праздничные дни', marker='o', linewidth=2, color='red')
+    plt.plot(working_consumption.index, working_consumption.values, 
+             label='Рабочие дни', marker='s', linewidth=2, color='blue')
+    plt.title('Сравнение суточного профиля потребления: праздники vs будни')
+    plt.xlabel('Час')
+    plt.ylabel('Потребление')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(f'{VISUALIZATIONS_FOLDER}holiday_vs_working.png', dpi=300, bbox_inches='tight')
+    plt.show()
+
+def plot_monthly_patterns(df):
+    """Месячные паттерны по типам дней"""
+    plt.figure(figsize=(15, 8))
+    monthly_pattern = df.groupby(['month', 'day_type'])['consumption'].mean().unstack()
+    monthly_pattern.plot(kind='bar', figsize=(15, 8))
+    plt.title('Среднемесячное потребление по типам дней')
+    plt.ylabel('Потребление')
+    plt.xlabel('Месяц')
+    plt.legend(title='Тип дня')
+    plt.xticks(rotation=0)
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(f'{VISUALIZATIONS_FOLDER}monthly_patterns.png', dpi=300, bbox_inches='tight')
+    plt.show()
+
+def plot_correlation_matrix(df):
+    """Матрица корреляций"""
+    correlation_features = [
+        'consumption', 'hour', 'temperature', 'humidity', 'wind_speed',
+        'is_holiday', 'is_working_day', 'is_weekend_or_holiday'
+    ]
+    
+    # Добавляем лаговые признаки, если они есть
+    lag_features = [col for col in df.columns if 'consumption_lag_' in col]
+    correlation_features.extend(lag_features[:2])  # Берем первые 2 лага
+    
+    # Проверяем существование колонок
+    available_features = [col for col in correlation_features if col in df.columns]
+    
+    correlation_matrix = df[available_features].corr()
+    plt.figure(figsize=(12, 10))
+    sns.heatmap(correlation_matrix, annot=True, cmap='coolwarm', center=0, fmt='.2f')
+    plt.title('Матрица корреляций ключевых признаков')
+    plt.tight_layout()
+    plt.savefig(f'{VISUALIZATIONS_FOLDER}correlation_matrix.png', dpi=300, bbox_inches='tight')
+    plt.show()
+
+def main():
+    """Основная функция визуализации"""
+    print("=== НАЧАЛО ВИЗУАЛИЗАЦИИ ДАННЫХ ===")
+    
+    # Создание папки для визуализаций
+    create_visualizations_folder()
+    
+    # Загрузка данных
+    df = load_data()
+    if df is None:
+        return
+    
+    # Построение графиков
+    print("Построение графиков...")
+    
+    plot_consumption_trend(df)
+    plot_hourly_profile(df)
+    plot_weekday_profile(df)
+    plot_temperature_dependency(df)
+    plot_daytype_consumption(df)
+    plot_heatmap_hour_daytype(df)
+    plot_holiday_vs_working(df)
+    plot_monthly_patterns(df)
+    plot_correlation_matrix(df)
+    
+    print("=== ВИЗУАЛИЗАЦИЯ ЗАВЕРШЕНА ===")
+    print(f"Графики сохранены в папке {VISUALIZATIONS_FOLDER}")
+
+if __name__ == "__main__":
+    main()
