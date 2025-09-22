@@ -1,0 +1,125 @@
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+
+# === КОНСТАНТЫ ===
+PROCESSED_DATA_FILE = 'processed_energy_data.csv'  # Исходный предобработанный файл
+FILTERED_DATA_FILE = 'filtered_training_data.csv'  # Файл с отфильтрованными данными
+WEATHER_FILE = 'weather_data.csv'                  # Исходный файл погоды
+CONSUMPTION_FILE = 'consumption_data.csv'          # Исходный файл потребления
+
+def load_and_filter_quality_data():
+    """Загрузка и фильтрация данных по качеству"""
+    print("=== ФИЛЬТРАЦИЯ ДАННЫХ ПО КАЧЕСТВУ ===")
+    
+    # Загрузка предобработанных данных
+    df = pd.read_csv(PROCESSED_DATA_FILE)
+    df['datetime'] = pd.to_datetime(df['datetime'])
+    
+    print(f"Исходные данные: {len(df)} записей")
+    
+    # Исключаем проблемные годы и сентябрь 2025
+    df['year'] = df['datetime'].dt.year
+    df['month'] = df['datetime'].dt.month
+    
+    # Фильтр: исключаем известные проблемные годы
+    problematic_years = [2017, 2023]  # По результатам диагностики
+    df_filtered = df[~df['year'].isin(problematic_years)]
+    
+    # Исключаем сентябрь 2025 (неполные данные)
+    df_filtered = df_filtered[
+        ~((df_filtered['year'] == 2025) & (df_filtered['month'] == 9))
+    ]
+    
+    print(f"После фильтрации проблемных лет: {len(df_filtered)} записей")
+    
+    # Фильтр по полноте данных (должно быть > 90% данных по погоде)
+    df_filtered['year_month'] = df_filtered['datetime'].dt.to_period('M')
+    monthly_stats = df_filtered.groupby('year_month').agg({
+        'consumption': 'count',
+        'temperature': lambda x: x.notna().sum()
+    }).rename(columns={'consumption': 'total_records', 'temperature': 'weather_records'})
+    
+    monthly_stats['completeness'] = monthly_stats['weather_records'] / monthly_stats['total_records']
+    good_months = monthly_stats[monthly_stats['completeness'] > 0.9].index
+    
+    df_filtered = df_filtered[df_filtered['year_month'].isin(good_months)]
+    print(f"После фильтрации по полноте: {len(df_filtered)} записей")
+    
+    return df_filtered
+
+def handle_missing_values(df):
+    """Обработка пропусков в данных"""
+    print("=== ОБРАБОТКА ПРОПУСКОВ ===")
+    
+    # Статистика пропусков
+    print("Пропуски до обработки:")
+    missing_stats = df.isnull().sum()
+    for col, count in missing_stats[missing_stats > 0].items():
+        print(f"  {col}: {count} ({count/len(df)*100:.2f}%)")
+    
+    # Интерполяция для временных рядов
+    weather_cols = ['temperature', 'humidity', 'wind_speed']
+    lag_cols = [col for col in df.columns if 'consumption_lag_' in col]
+    rolling_cols = [col for col in df.columns if 'consumption_rolling_' in col]
+    
+    # Интерполяция погодных данных
+    for col in weather_cols:
+        if col in df.columns:
+            # Интерполяция внутри дня
+            df[col] = df.groupby(df['datetime'].dt.date)[col].transform(
+                lambda x: x.interpolate(method='linear', limit=3, limit_direction='both')
+            )
+            # Заполнение оставшихся значений средним по часу
+            hourly_mean = df.groupby('hour')[col].transform('mean')
+            df[col] = df[col].fillna(hourly_mean)
+    
+    # Интерполяция лаговых признаков
+    for col in lag_cols:
+        df[col] = df[col].interpolate(method='linear', limit_direction='both')
+    
+    # Интерполяция скользящих признаков
+    for col in rolling_cols:
+        df[col] = df[col].interpolate(method='linear', limit_direction='both')
+    
+    # Финальное заполнение медианой для оставшихся пропусков
+    for col in weather_cols + lag_cols + rolling_cols:
+        if col in df.columns:
+            df[col] = df[col].fillna(df[col].median())
+    
+    print("Пропуски после обработки:")
+    missing_stats = df.isnull().sum()
+    for col, count in missing_stats[missing_stats > 0].items():
+        print(f"  {col}: {count} ({count/len(df)*100:.2f}%)")
+    
+    return df
+
+def create_final_dataset():
+    """Создание финального датасета для обучения"""
+    print("=== СОЗДАНИЕ ФИНАЛЬНОГО ДАТАСЕТА ===")
+    
+    # 1. Фильтрация по качеству
+    df = load_and_filter_quality_data()
+    
+    # 2. Обработка пропусков
+    df = handle_missing_values(df)
+    
+    # 3. Удаление оставшихся строк с пропусками в критических колонках
+    critical_cols = ['consumption', 'temperature', 'humidity', 'wind_speed']
+    df = df.dropna(subset=[col for col in critical_cols if col in df.columns])
+    
+    print(f"Финальный датасет: {len(df)} записей")
+    
+    # 4. Сохранение
+    df.to_csv(FILTERED_DATA_FILE, index=False)
+    print(f"Финальный датасет сохранен в {FILTERED_DATA_FILE}")
+    
+    # 5. Статистика
+    print(f"Период данных: {df['datetime'].min()} - {df['datetime'].max()}")
+    print(f"Количество лет: {df['year'].nunique()}")
+    print("Используемые годы:", sorted(df['year'].unique().tolist()))
+    
+    return df
+
+if __name__ == "__main__":
+    df_final = create_final_dataset()
