@@ -1,0 +1,204 @@
+#визуализация датасета
+
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from datetime import datetime
+import numpy as np
+
+# Загрузка предобработанных данных
+df = pd.read_csv('processed_data.csv')
+df['datetime'] = pd.to_datetime(df['datetime'])
+
+# === 1. Общая динамика потребления ===
+plt.figure(figsize=(15, 6))
+df.set_index('datetime')['consumption'].plot(alpha=0.7)
+plt.title('Динамика потребления по часам')
+plt.ylabel('Потребление')
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+# === 2. Суточный профиль потребления ===
+hourly_profile = df.groupby('hour')['consumption'].mean()
+plt.figure(figsize=(12, 5))
+hourly_profile.plot(kind='bar')
+plt.title('Среднее потребление по часам суток')
+plt.ylabel('Потребление')
+plt.xlabel('Час')
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+# === 3. Потребление по дням недели ===
+weekday_profile = df.groupby('dayofweek')['consumption'].mean()
+plt.figure(figsize=(10, 5))
+weekday_profile.plot(kind='bar')
+plt.title('Среднее потребление по дням недели')
+plt.ylabel('Потребление')
+plt.xlabel('День недели (0=Пн, 6=Вс)')
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+# === 4. Зависимость от температуры ===
+plt.figure(figsize=(12, 6))
+plt.scatter(df['temperature'], df['consumption'], alpha=0.3, s=1)
+plt.xlabel('Температура')
+plt.ylabel('Потребление')
+plt.title('Зависимость потребления от температуры')
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+# === 5. Тепловая карта потребления по часам и дням недели ===
+pivot_table = df.pivot_table(values='consumption', index='hour', columns='dayofweek', aggfunc='mean')
+plt.figure(figsize=(12, 8))
+sns.heatmap(pivot_table, annot=False, cmap='YlOrRd')
+plt.title('Тепловая карта потребления (часы vs дни недели)')
+plt.xlabel('День недели')
+plt.ylabel('Час')
+plt.tight_layout()
+plt.show()
+
+#Подготовка данных
+
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_absolute_error, mean_absolute_percentage_error
+import lightgbm as lgb
+
+# Загрузка данных
+df = pd.read_csv('processed_data.csv')
+df['datetime'] = pd.to_datetime(df['datetime'])
+
+# === Создание лаговых признаков ===
+def create_lag_features(df, lag_hours=[1, 2, 3, 24, 48, 168]):  # 168 = 7 дней
+    for lag in lag_hours:
+        df[f'consumption_lag_{lag}'] = df['consumption'].shift(lag)
+    return df
+
+df = create_lag_features(df)
+
+# === Создание скользящих средних ===
+def create_rolling_features(df, windows=[3, 6, 12, 24]):
+    for window in windows:
+        df[f'consumption_rolling_mean_{window}'] = df['consumption'].rolling(window=window).mean()
+        df[f'consumption_rolling_std_{window}'] = df['consumption'].rolling(window=window).std()
+    return df
+
+df = create_rolling_features(df)
+
+# === Удаление строк с NaN (из-за лагов) ===
+df = df.dropna()
+
+# === Подготовка признаков ===
+feature_columns = [
+    'hour', 'dayofweek', 'month', 'is_weekend',
+    'temperature', 'humidity', 'wind_speed',
+    'consumption_lag_1', 'consumption_lag_2', 'consumption_lag_3',
+    'consumption_lag_24', 'consumption_lag_48', 'consumption_lag_168',
+    'consumption_rolling_mean_3', 'consumption_rolling_mean_6',
+    'consumption_rolling_mean_12', 'consumption_rolling_mean_24',
+    'consumption_rolling_std_3', 'consumption_rolling_std_6',
+    'consumption_rolling_std_12', 'consumption_rolling_std_24'
+]
+
+target_column = 'consumption'
+
+# Удаление строк с NaN в признаках
+df = df.dropna(subset=feature_columns + [target_column])
+
+# === Разделение на train/test ===
+# Используем последние 30 дней для теста
+split_date = df['datetime'].max() - pd.Timedelta(days=30)
+train_df = df[df['datetime'] <= split_date]
+test_df = df[df['datetime'] > split_date]
+
+X_train = train_df[feature_columns]
+y_train = train_df[target_column]
+X_test = test_df[feature_columns]
+y_test = test_df[target_column]
+
+print(f"Размер обучающей выборки: {len(X_train)}")
+print(f"Размер тестовой выборки: {len(X_test)}")
+
+# обучение модели
+
+# === Обучение LightGBM ===
+lgb_train = lgb.Dataset(X_train, y_train)
+lgb_eval = lgb.Dataset(X_test, y_test, reference=lgb_train)
+
+# Параметры модели
+params = {
+    'objective': 'regression',
+    'metric': 'mae',
+    'boosting_type': 'gbdt',
+    'num_leaves': 31,
+    'learning_rate': 0.1,
+    'feature_fraction': 0.9,
+    'bagging_fraction': 0.8,
+    'bagging_freq': 5,
+    'verbose': 0,
+    'seed': 42
+}
+
+# Обучение
+model = lgb.train(
+    params,
+    lgb_train,
+    num_boost_round=1000,
+    valid_sets=[lgb_train, lgb_eval],
+    valid_names=['train', 'eval'],
+    callbacks=[lgb.early_stopping(stopping_rounds=50), lgb.log_evaluation(100)]
+)
+
+# === Предсказания ===
+y_pred_train = model.predict(X_train, num_iteration=model.best_iteration)
+y_pred_test = model.predict(X_test, num_iteration=model.best_iteration)
+
+# === Оценка качества ===
+mae_train = mean_absolute_error(y_train, y_pred_train)
+mae_test = mean_absolute_error(y_test, y_pred_test)
+mape_test = mean_absolute_percentage_error(y_test, y_pred_test) * 100
+
+print(f"MAE на обучении: {mae_train:.3f}")
+print(f"MAE на тесте: {mae_test:.3f}")
+print(f"MAPE на тесте: {mape_test:.2f}%")
+
+# === Важность признаков ===
+feature_importance = pd.DataFrame({
+    'feature': feature_columns,
+    'importance': model.feature_importance()
+}).sort_values('importance', ascending=False)
+
+plt.figure(figsize=(10, 8))
+sns.barplot(data=feature_importance.head(15), x='importance', y='feature')
+plt.title('Важность признаков (Top 15)')
+plt.tight_layout()
+plt.show()
+
+#Визуализация
+# === Сравнение предсказаний и реальных значений ===
+test_df['prediction'] = y_pred_test
+
+plt.figure(figsize=(15, 6))
+plt.plot(test_df['datetime'], test_df['consumption'], label='Реальное потребление', alpha=0.7)
+plt.plot(test_df['datetime'], test_df['prediction'], label='Прогноз', alpha=0.7)
+plt.legend()
+plt.title('Сравнение реального и прогнозируемого потребления')
+plt.ylabel('Потребление')
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+# === График ошибок ===
+test_df['error'] = np.abs(test_df['consumption'] - test_df['prediction'])
+plt.figure(figsize=(15, 6))
+plt.plot(test_df['datetime'], test_df['error'])
+plt.title('Абсолютная ошибка прогноза')
+plt.ylabel('Ошибка')
+plt.grid(True)
+plt.tight_layout()
+plt.show()
