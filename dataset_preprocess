@@ -1,0 +1,52 @@
+import pandas as pd
+import numpy as np
+from datetime import datetime
+
+# === Загрузка данных по потреблению ===
+df_consumption = pd.read_csv('consumption.csv', sep=';', parse_dates=['date'])
+
+# Преобразуем дату + час в datetime
+df_consumption['datetime'] = pd.to_datetime(df_consumption['date']) + pd.to_timedelta(df_consumption['hour'], unit='h')
+
+# Удаляем строки с пропусками в ключевых полях
+df_consumption = df_consumption.dropna(subset=['consumption', 'temperature'])
+
+# Удаляем температурный прогноз (если он не нужен)
+if 'temperature_forecast' in df_consumption.columns:
+    df_consumption = df_consumption.drop(columns=['temperature_forecast'])
+
+# === Загрузка данных по погоде ===
+df_weather = pd.read_csv('weather.csv', sep=';', skiprows=6, on_bad_lines='skip')
+
+# Переименуем колонки для удобства
+df_weather.columns = ['datetime', 'T', 'P0', 'P', 'U', 'DD', 'Ff', 'ff10', 'WW', 'WW2', 'clouds', 'VV', 'Td']
+
+# Преобразуем дату
+df_weather['datetime'] = pd.to_datetime(df_weather['datetime'], dayfirst=True)
+
+# Оставим только нужные колонки
+df_weather = df_weather[['datetime', 'T', 'U', 'Ff']].rename(columns={'T': 'temperature', 'U': 'humidity', 'Ff': 'wind_speed'})
+
+# Усредним по часам, если данные по 30 минут
+df_weather['datetime'] = df_weather['datetime'].dt.floor('H')
+df_weather = df_weather.groupby('datetime').mean().reset_index()
+
+# === Объединение данных по потреблению и погоде ===
+df = pd.merge(df_consumption, df_weather, on='datetime', how='left')
+
+# === Обработка праздников ===
+# Пример: загрузить и распарсить файл праздников
+# (опустим код, но можно использовать pandas + datetime)
+
+# Добавим признаки
+df['hour'] = df['datetime'].dt.hour
+df['dayofweek'] = df['datetime'].dt.dayofweek
+df['month'] = df['datetime'].dt.month
+df['is_weekend'] = df['dayofweek'].isin([5, 6]).astype(int)
+# df['is_holiday'] = ... # добавить позже
+
+# === Финальная очистка ===
+df = df.dropna()
+
+# === Сохранение результата ===
+df.to_csv('processed_data.csv', index=False)
