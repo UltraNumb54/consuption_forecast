@@ -1,0 +1,251 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from datetime import datetime
+
+# === КОНСТАНТЫ ===
+CONSUMPTION_FILE = 'consumption_data.csv'                    # Файл с потреблением
+WEATHER_FILE = 'weather_data.csv'                            # Файл с погодой
+CALENDAR_FILE = 'russian_production_calendar_2017_2025.csv'  # Файл с календарем
+
+def diagnose_consumption_data():
+    """Диагностика данных по потреблению"""
+    print("=== ДИАГНОСТИКА ДАННЫХ ПО ПОТРЕБЛЕНИЮ ===")
+    
+    try:
+        # Загрузка данных
+        df_cons = pd.read_csv(CONSUMPTION_FILE, sep=';')
+        df_cons['datetime'] = pd.to_datetime(df_cons['date']) + pd.to_timedelta(df_cons['hour'], unit='h')
+        df_cons = df_cons.sort_values('datetime')
+        
+        print(f"Общий размер данных: {len(df_cons)} строк")
+        print(f"Период: {df_cons['datetime'].min()} - {df_cons['datetime'].max()}")
+        
+        # Проверка пропусков
+        print("\nПропуски в данных:")
+        for col in df_cons.columns:
+            missing = df_cons[col].isna().sum()
+            if missing > 0:
+                print(f"  {col}: {missing} ({missing/len(df_cons)*100:.2f}%)")
+        
+        # Анализ плотности данных по годам
+        print("\nАнализ плотности данных по годам:")
+        df_cons['year'] = df_cons['datetime'].dt.year
+        yearly_counts = df_cons.groupby('year').size()
+        expected_per_year = 365 * 24  # 8760 часов в году
+        
+        for year, count in yearly_counts.items():
+            completeness = count / expected_per_year * 100
+            print(f"  {year}: {count} записей ({completeness:.1f}% полноты)")
+        
+        # Поиск пропусков во временных рядах
+        print("\nПоиск разрывов во временных рядах:")
+        df_cons = df_cons.sort_values('datetime')
+        df_cons['time_diff'] = df_cons['datetime'].diff()
+        
+        # Найдем большие разрывы (более 2 часов)
+        large_gaps = df_cons[df_cons['time_diff'] > pd.Timedelta(hours=2)]
+        if len(large_gaps) > 0:
+            print(f"Найдено {len(large_gaps)} больших разрывов:")
+            for idx, gap in large_gaps.head(10).iterrows():
+                prev_time = gap['datetime'] - gap['time_diff']
+                print(f"  {prev_time} -> {gap['datetime']} (разрыв: {gap['time_diff']})")
+        else:
+            print("Больших разрывов не найдено")
+        
+        # График плотности данных
+        plt.figure(figsize=(15, 6))
+        df_cons.set_index('datetime')['consumption'].plot(alpha=0.7, linewidth=0.5)
+        plt.title('Плотность данных по потреблению')
+        plt.ylabel('Потребление')
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig('diagnostics_consumption_density.png', dpi=300)
+        plt.show()
+        
+        return df_cons
+        
+    except Exception as e:
+        print(f"Ошибка при диагностике потребления: {e}")
+        return None
+
+def diagnose_weather_data():
+    """Диагностика данных по погоде"""
+    print("\n=== ДИАГНОСТИКА ДАННЫХ ПО ПОГОДЕ ===")
+    
+    try:
+        # Загрузка данных
+        with open(WEATHER_FILE, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        
+        # Пропускаем комментарии
+        data_start = 0
+        for i, line in enumerate(lines):
+            if line.strip().startswith('"Местное время'):
+                data_start = i + 1
+                break
+        
+        df_weather = pd.read_csv(WEATHER_FILE, sep=';', skiprows=data_start, encoding='utf-8')
+        print(f"Загружено строк погоды: {len(df_weather)}")
+        
+        # Преобразование даты
+        df_weather['datetime'] = pd.to_datetime(df_weather.iloc[:, 0], dayfirst=True)
+        df_weather = df_weather.sort_values('datetime')
+        
+        print(f"Период погоды: {df_weather['datetime'].min()} - {df_weather['datetime'].max()}")
+        
+        # Анализ плотности данных по годам
+        df_weather['year'] = df_weather['datetime'].dt.year
+        yearly_counts = df_weather.groupby('year').size()
+        
+        print("\nПлотность данных погоды по годам:")
+        for year, count in yearly_counts.items():
+            print(f"  {year}: {count} записей")
+        
+        # Поиск разрывов
+        df_weather = df_weather.sort_values('datetime')
+        df_weather['time_diff'] = df_weather['datetime'].diff()
+        
+        large_gaps = df_weather[df_weather['time_diff'] > pd.Timedelta(hours=2)]
+        if len(large_gaps) > 0:
+            print(f"\nНайдено {len(large_gaps)} больших разрывов в погоде:")
+            for idx, gap in large_gaps.head(5).iterrows():
+                prev_time = gap['datetime'] - gap['time_diff']
+                print(f"  {prev_time} -> {gap['datetime']} (разрыв: {gap['time_diff']})")
+        
+        # График плотности погоды
+        plt.figure(figsize=(15, 6))
+        # Усредняем по часам для графика
+        df_weather_plot = df_weather.copy()
+        df_weather_plot['datetime_hour'] = df_weather_plot['datetime'].dt.floor('H')
+        df_weather_plot = df_weather_plot.groupby('datetime_hour').first()
+        
+        if 'T' in df_weather_plot.columns:
+            df_weather_plot.set_index('datetime_hour')['T'].plot(alpha=0.7, linewidth=0.5)
+            plt.title('Плотность данных по температуре')
+            plt.ylabel('Температура (°C)')
+            plt.grid(True, alpha=0.3)
+            plt.tight_layout()
+            plt.savefig('diagnostics_weather_density.png', dpi=300)
+            plt.show()
+        
+        return df_weather
+        
+    except Exception as e:
+        print(f"Ошибка при диагностике погоды: {e}")
+        return None
+
+def diagnose_calendar_data():
+    """Диагностика календарных данных"""
+    print("\n=== ДИАГНОСТИКА КАЛЕНДАРНЫХ ДАННЫХ ===")
+    
+    try:
+        df_calendar = pd.read_csv(CALENDAR_FILE)
+        df_calendar['date'] = pd.to_datetime(df_calendar['date'])
+        
+        print(f"Календарных записей: {len(df_calendar)}")
+        print(f"Период: {df_calendar['date'].min()} - {df_calendar['date'].max()}")
+        
+        # Проверка типов дней
+        day_type_counts = df_calendar['day_type'].value_counts()
+        print("\nРаспределение типов дней:")
+        for day_type, count in day_type_counts.items():
+            print(f"  {day_type}: {count}")
+        
+        # Проверка полноты (должно быть по одному на каждый день)
+        expected_dates = pd.date_range(start=df_calendar['date'].min(), 
+                                     end=df_calendar['date'].max(), 
+                                     freq='D')
+        actual_dates = set(df_calendar['date'].dt.date)
+        expected_dates_set = set(expected_dates.date)
+        
+        missing_dates = expected_dates_set - actual_dates
+        extra_dates = actual_dates - expected_dates_set
+        
+        print(f"\nПроверка полноты календаря:")
+        print(f"  Ожидаемые даты: {len(expected_dates_set)}")
+        print(f"  Фактические даты: {len(actual_dates)}")
+        print(f"  Пропущенные даты: {len(missing_dates)}")
+        if missing_dates:
+            print(f"  Примеры пропущенных: {list(missing_dates)[:5]}")
+        
+        return df_calendar
+        
+    except Exception as e:
+        print(f"Ошибка при диагностике календаря: {e}")
+        return None
+
+def find_problematic_periods():
+    """Поиск проблемных периодов"""
+    print("\n=== ПОИСК ПРОБЛЕМНЫХ ПЕРИОДОВ ===")
+    
+    # Загрузим все данные
+    df_cons = diagnose_consumption_data()
+    df_weather = diagnose_weather_data()
+    df_calendar = diagnose_calendar_data()
+    
+    if df_cons is not None:
+        print("\n=== АНАЛИЗ ПРОБЛЕМНЫХ ПЕРИОДОВ ===")
+        
+        # Группировка по месяцам для поиска аномалий
+        df_cons['year_month'] = df_cons['datetime'].dt.to_period('M')
+        monthly_counts = df_cons.groupby('year_month').size()
+        
+        # Ожидаемое количество записей в месяц (~720 для полного месяца)
+        expected_per_month = 720
+        anomaly_threshold = expected_per_month * 0.5  # 50% от ожидаемого
+        
+        print(f"\nМесяцы с низкой плотностью данных (< {anomaly_threshold} записей):")
+        low_density_months = monthly_counts[monthly_counts < anomaly_threshold]
+        for month, count in low_density_months.items():
+            completeness = count / expected_per_month * 100
+            print(f"  {month}: {count} записей ({completeness:.1f}% полноты)")
+        
+        # Поиск аномальных значений потребления
+        print(f"\nАнализ аномальных значений потребления:")
+        consumption_stats = df_cons['consumption'].describe()
+        print("Статистика потребления:")
+        print(consumption_stats)
+        
+        # Поиск нулевых или отрицательных значений
+        zero_or_negative = df_cons[df_cons['consumption'] <= 0]
+        if len(zero_or_negative) > 0:
+            print(f"\nНайдено {len(zero_or_negative)} нулевых или отрицательных значений")
+            print("Примеры:")
+            print(zero_or_negative[['datetime', 'consumption']].head())
+        
+        # Поиск экстремальных значений (выбросов)
+        Q1 = df_cons['consumption'].quantile(0.25)
+        Q3 = df_cons['consumption'].quantile(0.75)
+        IQR = Q3 - Q1
+        lower_bound = Q1 - 1.5 * IQR
+        upper_bound = Q3 + 1.5 * IQR
+        
+        outliers = df_cons[(df_cons['consumption'] < lower_bound) | 
+                          (df_cons['consumption'] > upper_bound)]
+        print(f"\nНайдено {len(outliers)} выбросов (IQR метод)")
+        
+        return df_cons, df_weather, df_calendar
+
+def main():
+    """Основная функция диагностики"""
+    print("=== НАЧАЛО ДИАГНОСТИКИ ДАННЫХ ===")
+    
+    try:
+        df_cons, df_weather, df_calendar = find_problematic_periods()
+        print("\n=== ДИАГНОСТИКА ЗАВЕРШЕНА ===")
+        
+        # Создание сводного отчета
+        print("\n=== СВОДНЫЙ ОТЧЕТ ===")
+        if df_cons is not None:
+            print("Данные по потреблению: ЗАГРУЖЕНЫ")
+        if df_weather is not None:
+            print("Данные по погоде: ЗАГРУЖЕНЫ")
+        if df_calendar is not None:
+            print("Календарные данные: ЗАГРУЖЕНЫ")
+            
+    except Exception as e:
+        print(f"Ошибка при выполнении диагностики: {e}")
+
+if __name__ == "__main__":
+    main()
