@@ -43,29 +43,103 @@ def preprocess_weather_data():
     """Предобработка данных по погоде"""
     print("Загрузка данных по погоде...")
     try:
-        df_weather = pd.read_csv(WEATHER_FILE, sep=';', skiprows=6, on_bad_lines='skip')
+        # Сначала посмотрим структуру файла
+        with open(WEATHER_FILE, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        
+        # Пропускаем комментарии и находим начало данных
+        header_line = None
+        data_start = 0
+        for i, line in enumerate(lines):
+            if line.strip().startswith('"Местное время'):
+                header_line = line.strip()
+                data_start = i + 1
+                break
+        
+        if header_line is None:
+            print("Ошибка: Не найдена строка с заголовком в файле погоды")
+            return None
+        
+        print(f"Заголовок: {header_line}")
+        
+        # Загружаем только данные (пропускаем комментарии)
+        df_weather = pd.read_csv(
+            WEATHER_FILE, 
+            sep=';', 
+            skiprows=data_start,
+            on_bad_lines='skip',
+            encoding='utf-8'
+        )
+        
+        print(f"Загружено строк погоды: {len(df_weather)}")
+        print(f"Колонки в файле погоды: {list(df_weather.columns)}")
+        
+        if len(df_weather) == 0:
+            print("Ошибка: Файл погоды пуст!")
+            return None
+            
     except FileNotFoundError:
         print(f"Ошибка: Файл {WEATHER_FILE} не найден!")
         return None
+    except Exception as e:
+        print(f"Ошибка при загрузке файла погоды: {e}")
+        return None
     
-    # Переименуем колонки для удобства
-    df_weather.columns = ['datetime', 'T', 'P0', 'P', 'U', 'DD', 'Ff', 'ff10', 'WW', 'WW2', 'clouds', 'VV', 'Td']
+    # Проверим количество колонок
+    if len(df_weather.columns) >= 13:
+        # Переименуем колонки по порядку
+        column_names = [
+            'datetime', 'T', 'P0', 'P', 'U', 'DD', 'Ff', 'ff10', 
+            'WW', 'WW2', 'clouds', 'VV', 'Td'
+        ]
+        # Берем только нужное количество колонок
+        actual_columns = df_weather.columns[:13]
+        df_weather = df_weather[actual_columns]
+        df_weather.columns = column_names[:len(actual_columns)]
+    else:
+        print(f"Предупреждение: Неожиданное количество колонок: {len(df_weather.columns)}")
+        # Попробуем стандартное переименование
+        expected_names = ['datetime', 'T', 'P0', 'P', 'U', 'DD', 'Ff', 'ff10', 'WW', 'WW2', 'clouds', 'VV', 'Td']
+        for i, col in enumerate(df_weather.columns[:len(expected_names)]):
+            df_weather = df_weather.rename(columns={col: expected_names[i]})
     
     # Преобразуем дату
-    df_weather['datetime'] = pd.to_datetime(df_weather['datetime'], dayfirst=True)
+    try:
+        df_weather['datetime'] = pd.to_datetime(df_weather['datetime'], dayfirst=True)
+    except:
+        # Если не удалось, попробуем другой формат
+        try:
+            df_weather['datetime'] = pd.to_datetime(df_weather.iloc[:, 0], dayfirst=True)
+        except Exception as e:
+            print(f"Ошибка при преобразовании даты: {e}")
+            return None
     
-    # Оставим только нужные колонки
-    df_weather = df_weather[['datetime', 'T', 'U', 'Ff']].rename(columns={
-        'T': 'temperature', 
-        'U': 'humidity', 
-        'Ff': 'wind_speed'
-    })
+    # Оставим только нужные колонки (проверяем существование)
+    required_columns = ['datetime']
+    available_data_columns = ['T', 'U', 'Ff']
+    
+    for col in available_data_columns:
+        if col in df_weather.columns:
+            required_columns.append(col)
+    
+    # Фильтруем только существующие колонки
+    existing_columns = [col for col in required_columns if col in df_weather.columns]
+    if len(existing_columns) < 2:  # datetime + хотя бы одна колонка
+        print("Ошибка: Не найдены необходимые колонки в файле погоды")
+        return None
+        
+    df_weather = df_weather[existing_columns]
+    
+    # Переименовываем для унификации
+    rename_dict = {'T': 'temperature', 'U': 'humidity', 'Ff': 'wind_speed'}
+    df_weather = df_weather.rename(columns=rename_dict)
     
     # Усредним по часам, если данные по 30 минут
     df_weather['datetime'] = df_weather['datetime'].dt.floor('H')
     df_weather = df_weather.groupby('datetime').mean().reset_index()
     
     print(f"Данные по погоде обработаны. Размер: {len(df_weather)}")
+    print(f"Финальные колонки: {list(df_weather.columns)}")
     return df_weather
 
 def load_calendar():
