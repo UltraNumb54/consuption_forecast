@@ -1,0 +1,166 @@
+#data_preprocessing.py
+
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+
+# === КОНСТАНТЫ ===
+CONSUMPTION_FILE = 'consumption_data.csv'                    # Файл с потреблением
+WEATHER_FILE = 'weather_data.csv'                            # Файл с погодой
+CALENDAR_FILE = 'russian_production_calendar_2017_2025.csv'  # Файл с календарем (уже сгенерирован)
+OUTPUT_FILE = 'processed_energy_data.csv'                    # Выходной файл
+
+def preprocess_consumption_data():
+    """Предобработка данных по потреблению"""
+    print("Загрузка данных по потреблению...")
+    try:
+        df_consumption = pd.read_csv(CONSUMPTION_FILE, sep=';', parse_dates=['date'])
+    except FileNotFoundError:
+        print(f"Ошибка: Файл {CONSUMPTION_FILE} не найден!")
+        return None
+    
+    # Преобразуем дату + час в datetime
+    df_consumption['datetime'] = pd.to_datetime(df_consumption['date']) + pd.to_timedelta(df_consumption['hour'], unit='h')
+    
+    # Удаляем строки с пропусками в ключевых полях
+    df_consumption = df_consumption.dropna(subset=['consumption', 'temperature'])
+    
+    # Удаляем температурный прогноз (если он не нужен)
+    if 'temperature_forecast' in df_consumption.columns:
+        df_consumption = df_consumption.drop(columns=['temperature_forecast'])
+    
+    # Создаем базовые признаки
+    df_consumption['date_only'] = df_consumption['datetime'].dt.date
+    df_consumption['hour'] = df_consumption['datetime'].dt.hour
+    df_consumption['dayofweek'] = df_consumption['datetime'].dt.dayofweek
+    df_consumption['month'] = df_consumption['datetime'].dt.month
+    df_consumption['is_weekend'] = df_consumption['dayofweek'].isin([5, 6]).astype(int)
+    
+    print(f"Данные по потреблению обработаны. Размер: {len(df_consumption)}")
+    return df_consumption
+
+def preprocess_weather_data():
+    """Предобработка данных по погоде"""
+    print("Загрузка данных по погоде...")
+    try:
+        df_weather = pd.read_csv(WEATHER_FILE, sep=';', skiprows=6, on_bad_lines='skip')
+    except FileNotFoundError:
+        print(f"Ошибка: Файл {WEATHER_FILE} не найден!")
+        return None
+    
+    # Переименуем колонки для удобства
+    df_weather.columns = ['datetime', 'T', 'P0', 'P', 'U', 'DD', 'Ff', 'ff10', 'WW', 'WW2', 'clouds', 'VV', 'Td']
+    
+    # Преобразуем дату
+    df_weather['datetime'] = pd.to_datetime(df_weather['datetime'], dayfirst=True)
+    
+    # Оставим только нужные колонки
+    df_weather = df_weather[['datetime', 'T', 'U', 'Ff']].rename(columns={
+        'T': 'temperature', 
+        'U': 'humidity', 
+        'Ff': 'wind_speed'
+    })
+    
+    # Усредним по часам, если данные по 30 минут
+    df_weather['datetime'] = df_weather['datetime'].dt.floor('H')
+    df_weather = df_weather.groupby('datetime').mean().reset_index()
+    
+    print(f"Данные по погоде обработаны. Размер: {len(df_weather)}")
+    return df_weather
+
+def load_calendar():
+    """Загрузка существующего производственного календаря"""
+    print("Загрузка производственного календаря...")
+    try:
+        df_calendar = pd.read_csv(CALENDAR_FILE)
+        df_calendar['date'] = pd.to_datetime(df_calendar['date']).dt.date
+        print(f"Производственный календарь загружен. Размер: {len(df_calendar)}")
+        return df_calendar
+    except FileNotFoundError:
+        print(f"Ошибка: Файл {CALENDAR_FILE} не найден!")
+        print("Пожалуйста, укажите правильный путь к файлу календаря в константе CALENDAR_FILE")
+        return None
+
+def create_lag_features(df, lag_hours=[1, 2, 3, 24, 48, 168]):
+    """Создание лаговых признаков"""
+    print("Создание лаговых признаков...")
+    for lag in lag_hours:
+        df[f'consumption_lag_{lag}'] = df['consumption'].shift(lag)
+    return df
+
+def create_rolling_features(df, windows=[3, 6, 12, 24]):
+    """Создание скользящих признаков"""
+    print("Создание скользящих признаков...")
+    for window in windows:
+        df[f'consumption_rolling_mean_{window}'] = df['consumption'].rolling(window=window).mean()
+        df[f'consumption_rolling_std_{window}'] = df['consumption'].rolling(window=window).std()
+    return df
+
+def main():
+    """Основная функция предобработки"""
+    print("=== НАЧАЛО ПРЕДОБРАБОТКИ ДАННЫХ ===")
+    
+    # 1. Предобработка данных по потреблению
+    df_consumption = preprocess_consumption_data()
+    if df_consumption is None:
+        return
+    
+    # 2. Предобработка данных по погоде
+    df_weather = preprocess_weather_data()
+    if df_weather is None:
+        return
+    
+    # 3. Загрузка календаря
+    df_calendar = load_calendar()
+    if df_calendar is None:
+        return
+    
+    # 4. Объединение датасетов
+    print("Объединение датасетов...")
+    df_merged = pd.merge(df_consumption, df_weather, on='datetime', how='left')
+    
+    # Преобразуем даты для объединения
+    df_merged['date_for_merge'] = pd.to_datetime(df_merged['date_only'])
+    df_calendar['date_for_merge'] = pd.to_datetime(df_calendar['date'])
+    
+    df_final = pd.merge(df_merged, df_calendar, left_on='date_for_merge', right_on='date_for_merge', how='left')
+    
+    # 5. Создание признаков календаря
+    df_final['is_holiday'] = (df_final['day_type'] == 'non-working holiday').astype(int)
+    df_final['is_working_weekend'] = (df_final['day_type'] == 'working weekend').astype(int)
+    df_final['is_regular_weekend'] = (df_final['day_type'] == 'weekend').astype(int)
+    df_final['is_working_day'] = (df_final['day_type'] == 'working day').astype(int)
+    df_final['is_weekend_or_holiday'] = (
+        (df_final['day_type'] == 'weekend') | 
+        (df_final['day_type'] == 'non-working holiday')
+    ).astype(int)
+    
+    # 6. Создание лаговых и скользящих признаков
+    df_final = df_final.sort_values('datetime')
+    df_final = create_lag_features(df_final)
+    df_final = create_rolling_features(df_final)
+    
+    # 7. Удаление строк с NaN (из-за лагов)
+    initial_size = len(df_final)
+    df_final = df_final.dropna()
+    final_size = len(df_final)
+    print(f"Удалено строк с пропусками: {initial_size - final_size}")
+    
+    # 8. Удаление временных колонок
+    columns_to_drop = ['date_for_merge_x', 'date_for_merge_y']
+    df_final = df_final.drop(columns=[col for col in columns_to_drop if col in df_final.columns])
+    
+    # 9. Сохранение результата
+    df_final.to_csv(OUTPUT_FILE, index=False)
+    print(f"=== ПРЕДОБРАБОТКА ЗАВЕРШЕНА ===")
+    print(f"Финальный датасет сохранен в {OUTPUT_FILE}")
+    print(f"Размер: {len(df_final)} строк, {len(df_final.columns)} колонок")
+    
+    # Вывод информации о колонках
+    print("\nКолонки в финальном датасете:")
+    for i, col in enumerate(df_final.columns, 1):
+        print(f"  {i:2d}. {col}")
+
+if __name__ == "__main__":
+    main()
+
