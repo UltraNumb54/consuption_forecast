@@ -3,169 +3,99 @@ import numpy as np
 import matplotlib.pyplot as plt
 from datetime import datetime
 
+# === КОНСТАНТЫ ДЛЯ ВХОДНЫХ ДАННЫХ ===
+CONSUMPTION_FILE = 'consumption_data.csv'                    # Исходный файл с потреблением
+WEATHER_FILE = 'weather_data.csv'                            # Исходный файл с погодой
+CALENDAR_FILE = 'russian_production_calendar_2017_2025.csv'  # Файл с календарем
+OUTPUT_DIAGNOSTICS_PLOT = 'diagnostics_2019.png'             # Файл для сохранения графика
+TARGET_YEAR = 2019                                           # Год для диагностики
+
 def diagnose_2019_problem():
     """Детальная диагностика проблемы с 2019 годом"""
     
-    print("=== ДЕТАЛЬНАЯ ДИАГНОСТИКА 2019 ГОДА ===")
+    print(f"=== ДЕТАЛЬНАЯ ДИАГНОСТИКА {TARGET_YEAR} ГОДА ===")
     
-    # 1. Загрузим данные по потреблению за 2019
-    df_cons = pd.read_csv('consumption_data.csv', sep=';')
+    # 1. Загрузка данных по потреблению
+    print(f"Загрузка данных потребления из {CONSUMPTION_FILE}...")
+    df_cons = pd.read_csv(CONSUMPTION_FILE, sep=';')
     df_cons['datetime'] = pd.to_datetime(df_cons['date']) + pd.to_timedelta(df_cons['hour'], unit='h')
-    df_cons_2019 = df_cons[df_cons['datetime'].dt.year == 2019].sort_values('datetime')
+    df_cons_target = df_cons[df_cons['datetime'].dt.year == TARGET_YEAR].sort_values('datetime')
     
-    print(f"Данные потребления 2019: {len(df_cons_2019)} записей")
-    print(f"Период: {df_cons_2019['datetime'].min()} - {df_cons_2019['datetime'].max()}")
+    print(f"Данные потребления {TARGET_YEAR}: {len(df_cons_target)} записей")
     
-    # 2. Загрузим данные погоды за 2019
-    with open('weather_data.csv', 'r', encoding='utf-8') as f:
+    # 2. Загрузка данных погоды
+    print(f"Загрузка данных погоды из {WEATHER_FILE}...")
+    with open(WEATHER_FILE, 'r', encoding='utf-8') as f:
         lines = f.readlines()
     
+    # Найдем начало данных
     data_start = 0
     for i, line in enumerate(lines):
         if line.strip().startswith('"Местное время'):
             data_start = i + 1
             break
     
-    df_weather = pd.read_csv('weather_data.csv', sep=';', skiprows=data_start, 
+    df_weather = pd.read_csv(WEATHER_FILE, sep=';', skiprows=data_start, 
                            encoding='utf-8', on_bad_lines='skip')
     df_weather['datetime'] = pd.to_datetime(df_weather.iloc[:, 0], dayfirst=True)
-    df_weather_2019 = df_weather[df_weather['datetime'].dt.year == 2019].sort_values('datetime')
+    df_weather_target = df_weather[df_weather['datetime'].dt.year == TARGET_YEAR].sort_values('datetime')
     
-    print(f"Данные погоды 2019: {len(df_weather_2019)} записей")
-    print(f"Период: {df_weather_2019['datetime'].min()} - {df_weather_2019['datetime'].max()}")
+    print(f"Данные погоды {TARGET_YEAR}: {len(df_weather_target)} записей")
     
-    # 3. Анализ плотности данных по месяцам
-    print("\n=== АНАЛИЗ ПЛОТНОСТИ ПО МЕСЯЦАМ ===")
+    # 3. Анализ плотности по месяцам
+    df_cons_target['month'] = df_cons_target['datetime'].dt.month
+    monthly_cons = df_cons_target.groupby('month').size()
     
-    # Потребление по месяцам
-    df_cons_2019['month'] = df_cons_2019['datetime'].dt.month
-    monthly_cons = df_cons_2019.groupby('month').size()
+    df_weather_target['month'] = df_weather_target['datetime'].dt.month
+    df_weather_target['datetime_hour'] = df_weather_target['datetime'].dt.floor('H')
+    monthly_weather = df_weather_target.groupby('month')['datetime_hour'].nunique()
     
-    # Погода по месяцам  
-    df_weather_2019['month'] = df_weather_2019['datetime'].dt.month
-    df_weather_2019['datetime_hour'] = df_weather_2019['datetime'].dt.floor('H')
-    monthly_weather = df_weather_2019.groupby('month')['datetime_hour'].nunique()
-    
-    print("Плотность данных по месяцам 2019:")
-    print("Месяц | Потребление | Погода | Совпадение")
-    print("-" * 40)
+    print(f"\nПлотность данных {TARGET_YEAR} по месяцам:")
+    print("Месяц | Потребление | Погода | Разница")
+    print("-" * 45)
     for month in range(1, 13):
         cons_count = monthly_cons.get(month, 0)
         weather_count = monthly_weather.get(month, 0)
-        print(f"{month:2d}    | {cons_count:4d}       | {weather_count:4d}   | {cons_count-weather_count:+4d}")
+        difference = cons_count - weather_count
+        print(f"{month:2d}    | {cons_count:6d}    | {weather_count:6d} | {difference:+6d}")
     
-    # 4. Поиск конкретных проблемных периодов
-    print("\n=== ПОИСК ПРОБЛЕМНЫХ ПЕРИОДОВ ===")
+    # 4. Визуализация
+    plt.figure(figsize=(15, 8))
     
-    # Создадим полный временной ряд за 2019
-    full_range = pd.date_range(start='2019-01-01', end='2019-12-31 23:00:00', freq='H')
-    full_df = pd.DataFrame({'datetime': full_range})
+    # График плотности данных
+    plt.subplot(2, 1, 1)
+    months = range(1, 13)
+    cons_values = [monthly_cons.get(m, 0) for m in months]
+    weather_values = [monthly_weather.get(m, 0) for m in months]
     
-    # Объединим с данными
-    df_merged_check = pd.merge(full_df, df_cons_2019[['datetime', 'consumption']], on='datetime', how='left')
-    df_merged_check = pd.merge(df_merged_check, df_weather_2019[['datetime_hour', 'T']], 
-                              left_on='datetime', right_on='datetime_hour', how='left')
-    
-    # Найдем пропуски
-    missing_consumption = df_merged_check[df_merged_check['consumption'].isna()]
-    missing_weather = df_merged_check[df_merged_check['T'].isna()]
-    
-    print(f"Пропущенные часы потребления: {len(missing_consumption)}")
-    print(f"Пропущенные часы погоды: {len(missing_weather)}")
-    
-    # 5. Визуализация плотности данных
-    plt.figure(figsize=(15, 10))
-    
-    # График 1: Потребление по месяцам
-    plt.subplot(2, 2, 1)
-    monthly_cons.plot(kind='bar')
-    plt.title('Потребление по месяцам 2019')
+    plt.plot(months, cons_values, marker='o', label='Потребление', linewidth=2)
+    plt.plot(months, weather_values, marker='s', label='Погода', linewidth=2)
+    plt.title(f'Плотность данных по месяцам {TARGET_YEAR}')
     plt.ylabel('Количество записей')
-    plt.xticks(rotation=0)
+    plt.xlabel('Месяц')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
     
-    # График 2: Погода по месяцам
-    plt.subplot(2, 2, 2)
-    monthly_weather.plot(kind='bar', color='orange')
-    plt.title('Погода по месяцам 2019')
-    plt.ylabel('Количество записей')
-    plt.xticks(rotation=0)
-    
-    # График 3: Совпадение данных
-    plt.subplot(2, 2, 3)
-    overlap = pd.merge(df_cons_2019[['datetime']], 
-                      df_weather_2019[['datetime_hour']], 
-                      left_on='datetime', right_on='datetime_hour', how='inner')
-    overlap['month'] = overlap['datetime'].dt.month
-    monthly_overlap = overlap.groupby('month').size()
-    monthly_overlap.plot(kind='bar', color='green')
-    plt.title('Совпадающие данные по месяцам')
-    plt.ylabel('Количество совпадений')
-    plt.xticks(rotation=0)
-    
-    # График 4: Временная линия пропусков
-    plt.subplot(2, 2, 4)
-    df_plot = df_merged_check.copy()
-    df_plot['has_consumption'] = ~df_plot['consumption'].isna()
-    df_plot['has_weather'] = ~df_plot['T'].isna()
-    df_plot['both'] = df_plot['has_consumption'] & df_plot['has_weather']
-    
-    # Покажем недельные агрегаты для наглядности
-    df_plot['week'] = df_plot['datetime'].dt.isocalendar().week
-    weekly_stats = df_plot.groupby('week').agg({
-        'has_consumption': 'mean',
-        'has_weather': 'mean', 
-        'both': 'mean'
-    })
-    
-    weekly_stats.plot(kind='line')
-    plt.title('Недельная полнота данных 2019')
-    plt.ylabel('Доля полных записей')
-    plt.xlabel('Неделя года')
-    plt.legend(['Потребление', 'Погода', 'Оба'])
+    # График разницы
+    plt.subplot(2, 1, 2)
+    differences = [cons_values[i] - weather_values[i] for i in range(12)]
+    colors = ['red' if x < 0 else 'green' for x in differences]
+    plt.bar(months, differences, color=colors, alpha=0.7)
+    plt.title(f'Разница между потреблением и погодой по месяцам {TARGET_YEAR}')
+    plt.ylabel('Разница (потребление - погода)')
+    plt.xlabel('Месяц')
     plt.grid(True, alpha=0.3)
     
     plt.tight_layout()
-    plt.savefig('diagnostics_2019.png', dpi=300, bbox_inches='tight')
+    plt.savefig(OUTPUT_DIAGNOSTICS_PLOT, dpi=300, bbox_inches='tight')
     plt.show()
     
-    # 6. Детальный анализ формата времени
-    print("\n=== АНАЛИЗ ФОРМАТА ВРЕМЕНИ ===")
-    
-    # Проверим формат времени в погоде
-    sample_weather = df_weather_2019.head(10)
-    print("Примеры временных меток погоды:")
-    for idx, row in sample_weather.iterrows():
-        print(f"  {row['datetime']} - {type(row['datetime'])}")
-    
-    # Проверим формат времени в потреблении
-    sample_cons = df_cons_2019.head(10)
-    print("Примеры временных меток потребления:")
-    for idx, row in sample_cons.iterrows():
-        print(f"  {row['datetime']} - {type(row['datetime'])}")
-    
-    # Проверим точное совпадение времени
-    print("\n=== ПРОВЕРКА ТОЧНОГО СОВПАДЕНИЯ ВРЕМЕНИ ===")
-    
-    # Округлим погоду до часов
-    df_weather_2019['datetime_hour'] = df_weather_2019['datetime'].dt.floor('H')
-    
-    # Попробуем объединение
-    test_merge = pd.merge(
-        df_cons_2019[['datetime', 'consumption']].head(100),
-        df_weather_2019[['datetime_hour', 'T']].head(1000),
-        left_on='datetime', right_on='datetime_hour', how='left'
-    )
-    
-    merge_success = len(test_merge[test_merge['T'].notna()])
-    print(f"Успешных объединений в тестовой выборке: {merge_success}/100")
-    
-    return df_cons_2019, df_weather_2019
+    print(f"\nГрафик сохранен в {OUTPUT_DIAGNOSTICS_PLOT}")
 
 def main():
     try:
         diagnose_2019_problem()
         print("\n=== ДИАГНОСТИКА ЗАВЕРШЕНА ===")
-        print("График сохранен в diagnostics_2019.png")
     except Exception as e:
         print(f"Ошибка при диагностике: {e}")
 
