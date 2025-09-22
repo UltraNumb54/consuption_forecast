@@ -1,0 +1,338 @@
+'''Для предсказания на 1-3 дня вперед нужны исторические данные за:
+
+Минимум 1 неделя (168 часов) - для лага consumption_lag_168
+Оптимально 2 недели - для лучшей точности скользящих средних
+
+Входные данные для предсказания:
+
+'''
+
+# Для каждого часа предсказания нужны:
+INPUT_FEATURES = {
+    # Временные признаки
+    'hour': 0-23,           # Час предсказания
+    'dayofweek': 0-6,       # День недели
+    'month': 1-12,          # Месяц
+    
+    # Погодные данные на момент предсказания
+    'temperature': float,   # Температура
+    'humidity': float,      # Влажность
+    'wind_speed': float,    # Скорость ветра
+    
+    # Лаговые признаки (исторические данные)
+    'consumption_lag_1': float,    # 1 час назад
+    'consumption_lag_2': float,    # 2 часа назад
+    'consumption_lag_3': float,    # 3 часа назад
+    'consumption_lag_24': float,   # 24 часа назад
+    'consumption_lag_48': float,   # 48 часов назад
+    'consumption_lag_168': float,  # 168 часов назад (неделя)
+    
+    # Скользящие признаки (рассчитываются из исторических данных)
+    'consumption_rolling_mean_3': float,
+    'consumption_rolling_mean_6': float,
+    'consumption_rolling_mean_12': float,
+    'consumption_rolling_mean_24': float,
+    'consumption_rolling_std_3': float,
+    'consumption_rolling_std_6': float,
+    'consumption_rolling_std_12': float,
+    'consumption_rolling_std_24': float,
+    
+    # Календарные признаки
+    'is_holiday': 0/1,
+    'is_working_day': 0/1,
+    'is_weekend': 0/1,
+    'is_weekend_or_holiday': 0/1
+}
+
+
+# Нужны данные за последние 7-14 дней
+# Плюс прогноз погоды на 3 дня вперед
+# Плюс календарная информация
+
+# Сегодня 2025-09-13 14:00
+# Нужно предсказать на 2025-09-14 00:00 до 2025-09-16 23:00
+# Требуются:
+# 1. Данные с 2025-09-06 00:00 по 2025-09-13 14:00 (история)
+# 2. Прогноз погоды на 2025-09-14 00:00 - 2025-09-16 23:00
+# 3. Календарная информация
+
+
+import pandas as pd
+import numpy as np
+from catboost import CatBoostRegressor
+import matplotlib.pyplot as plt
+from datetime import datetime, timedelta
+
+# === КОНСТАНТЫ ===
+MODEL_PATH = 'energy_forecast_model.cbm'
+FILTERED_DATA_FILE = 'filtered_training_data.csv'  # Данные без сентября 2025
+HISTORICAL_DATA_FILE = 'processed_energy_data.csv'  # Все данные (включая сентябрь)
+TEST_START_DATE = '2025-09-13'  # Дата начала тестирования
+TEST_DAYS = 3  # Количество дней для предсказания
+
+def load_model():
+    """Загрузка обученной модели"""
+    model = CatBoostRegressor()
+    model.load_model(MODEL_PATH)
+    return model
+
+def calculate_rolling_features(consumption_series, window):
+    """Расчет скользящих признаков"""
+    if len(consumption_series) < window:
+        return np.nan, np.nan
+    
+    mean_val = np.mean(consumption_series[-window:])
+    std_val = np.std(consumption_series[-window:]) if window > 1 else 0
+    return mean_val, std_val
+
+def prepare_features_for_prediction(df_historical, prediction_datetime, weather_data):
+    """Подготовка признаков для одного предсказания"""
+    
+    # Базовые временные признаки
+    features = {
+        'hour': prediction_datetime.hour,
+        'dayofweek': prediction_datetime.weekday(),
+        'month': prediction_datetime.month,
+    }
+    
+    # Погодные данные
+    features.update({
+        'temperature': weather_data.get('temperature', 10.0),  # дефолтные значения
+        'humidity': weather_data.get('humidity', 70.0),
+        'wind_speed': weather_data.get('wind_speed', 3.0),
+    })
+    
+    # Лаговые признаки (берем из исторических данных)
+    for lag in [1, 2, 3, 24, 48, 168]:
+        lag_time = prediction_datetime - timedelta(hours=lag)
+        lag_data = df_historical[df_historical['datetime'] == lag_time]
+        if len(lag_data) > 0:
+            features[f'consumption_lag_{lag}'] = lag_data['consumption'].iloc[0]
+        else:
+            features[f'consumption_lag_{lag}'] = np.nan  # Будет обработано позже
+    
+    # Скользящие признаки
+    for window in [3, 6, 12, 24]:
+        # Берем последние window значений
+        recent_data = df_historical[
+            df_historical['datetime'] < prediction_datetime
+        ].tail(window)
+        
+        if len(recent_data) >= window:
+            mean_val, std_val = calculate_rolling_features(
+                recent_data['consumption'].values, window
+            )
+            features[f'consumption_rolling_mean_{window}'] = mean_val
+            features[f'consumption_rolling_std_{window}'] = std_val
+        else:
+            features[f'consumption_rolling_mean_{window}'] = np.nan
+            features[f'consumption_rolling_std_{window}'] = np.nan
+    
+    # Календарные признаки
+    date_only = prediction_datetime.date()
+    calendar_data = df_historical[df_historical['date_only'] == date_only]
+    
+    if len(calendar_data) > 0:
+        calendar_row = calendar_data.iloc[0]
+        features.update({
+            'is_holiday': calendar_row.get('is_holiday', 0),
+            'is_working_weekend': calendar_row.get('is_working_weekend', 0),
+            'is_regular_weekend': calendar_row.get('is_regular_weekend', 0),
+            'is_working_day': calendar_row.get('is_working_day', 0),
+            'is_weekend_or_holiday': calendar_row.get('is_weekend_or_holiday', 0),
+            'is_weekend': calendar_row.get('is_weekend', 0),
+        })
+    else:
+        # Дефолтные значения
+        features.update({
+            'is_holiday': 0,
+            'is_working_weekend': 0,
+            'is_regular_weekend': int(prediction_datetime.weekday() in [5, 6]),
+            'is_working_day': int(prediction_datetime.weekday() not in [5, 6]),
+            'is_weekend_or_holiday': int(prediction_datetime.weekday() in [5, 6]),
+            'is_weekend': int(prediction_datetime.weekday() in [5, 6]),
+        })
+    
+    return features
+
+def retrospective_test():
+    """Ретроспективное тестирование на сентябрь 2025"""
+    
+    print("=== РЕТРОСПЕКТИВНОЕ ТЕСТИРОВАНИЕ ===")
+    
+    # Загрузка модели
+    model = load_model()
+    print("Модель загружена")
+    
+    # Загрузка исторических данных (включая сентябрь 2025)
+    df_historical = pd.read_csv(HISTORICAL_DATA_FILE)
+    df_historical['datetime'] = pd.to_datetime(df_historical['datetime'])
+    df_historical['date_only'] = df_historical['datetime'].dt.date
+    print(f"Исторические данные загружены: {len(df_historical)} записей")
+    
+    # Определяем период тестирования
+    test_start = datetime.strptime(TEST_START_DATE, '%Y-%m-%d')
+    test_end = test_start + timedelta(days=TEST_DAYS)
+    
+    print(f"Тестирование с {test_start} по {test_end}")
+    
+    # Фильтруем данные до тестового периода
+    training_data = df_historical[df_historical['datetime'] < test_start]
+    test_data = df_historical[
+        (df_historical['datetime'] >= test_start) & 
+        (df_historical['datetime'] < test_end)
+    ]
+    
+    print(f"Данные для обучения признаков: {len(training_data)} записей")
+    print(f"Тестовые данные: {len(test_data)} записей")
+    
+    if len(test_data) == 0:
+        print("Нет тестовых данных!")
+        return
+    
+    # Подготовка предсказаний
+    predictions = []
+    actual_values = []
+    prediction_times = []
+    
+    # Для каждого часа в тестовом периоде
+    for idx, row in test_data.iterrows():
+        prediction_time = row['datetime']
+        actual_consumption = row['consumption']
+        
+        print(f"Предсказание для {prediction_time}: ", end="")
+        
+        # Подготовка погодных данных (берем реальные)
+        weather_data = {
+            'temperature': row.get('temperature', 10.0),
+            'humidity': row.get('humidity', 70.0),
+            'wind_speed': row.get('wind_speed', 3.0),
+        }
+        
+        # Подготовка признаков
+        features = prepare_features_for_prediction(
+            training_data, prediction_time, weather_data
+        )
+        
+        # Создание DataFrame для предсказания
+        features_df = pd.DataFrame([features])
+        
+        # Обработка пропусков (заполнение медианой из обучающих данных)
+        for col in features_df.columns:
+            if features_df[col].isna().any():
+                # Ищем медиану в обучающих данных
+                if col in training_data.columns:
+                    median_val = training_data[col].median()
+                    features_df[col] = features_df[col].fillna(median_val)
+                else:
+                    features_df[col] = features_df[col].fillna(0)
+        
+        # Выполнение предсказания
+        try:
+            prediction = model.predict(features_df)[0]
+            predictions.append(prediction)
+            actual_values.append(actual_consumption)
+            prediction_times.append(prediction_time)
+            
+            print(f"предсказано {prediction:.1f}, реально {actual_consumption:.1f}")
+            
+        except Exception as e:
+            print(f"ошибка: {e}")
+            continue
+    
+    # Оценка качества
+    if len(predictions) > 0:
+        from sklearn.metrics import mean_absolute_error, mean_absolute_percentage_error
+        
+        mae = mean_absolute_error(actual_values, predictions)
+        mape = mean_absolute_percentage_error(actual_values, predictions) * 100
+        
+        print(f"\n=== РЕЗУЛЬТАТЫ ТЕСТИРОВАНИЯ ===")
+        print(f"Количество предсказаний: {len(predictions)}")
+        print(f"MAE: {mae:.3f}")
+        print(f"MAPE: {mape:.2f}%")
+        print(f"Среднее потребление: {np.mean(actual_values):.1f}")
+        print(f"Точность (±2.5% от среднего): {mae < (np.mean(actual_values) * 0.025)}")
+        
+        # Визуализация
+        plt.figure(figsize=(15, 8))
+        
+        plt.subplot(2, 1, 1)
+        plt.plot(prediction_times, actual_values, 'b-', label='Реальное', linewidth=2)
+        plt.plot(prediction_times, predictions, 'r--', label='Предсказанное', linewidth=2)
+        plt.title(f'Ретроспективное тестирование ({TEST_START_DATE} + {TEST_DAYS} дней)')
+        plt.ylabel('Потребление (МВт)')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        
+        plt.subplot(2, 1, 2)
+        errors = np.abs(np.array(actual_values) - np.array(predictions))
+        plt.plot(prediction_times, errors, 'g-', alpha=0.7)
+        plt.title(f'Абсолютные ошибки (MAE = {mae:.3f})')
+        plt.ylabel('Ошибка (МВт)')
+        plt.xlabel('Время')
+        plt.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.savefig('retrospective_test_results.png', dpi=300, bbox_inches='tight')
+        plt.show()
+        
+        # Сохранение результатов
+        results_df = pd.DataFrame({
+            'datetime': prediction_times,
+            'actual_consumption': actual_values,
+            'predicted_consumption': predictions,
+            'absolute_error': errors
+        })
+        results_df.to_csv('retrospective_test_detailed.csv', index=False)
+        print("Детальные результаты сохранены в retrospective_test_detailed.csv")
+        
+    else:
+        print("Не удалось выполнить ни одного предсказания!")
+
+def explain_prediction_requirements():
+    """Объяснение требований для предсказаний"""
+    print("\n" + "="*70)
+    print("ТРЕБОВАНИЯ ДЛЯ ПРЕДСКАЗАНИЙ НА 1-3 ДНЯ")
+    print("="*70)
+    
+    print("""
+🕒 МИНИМАЛЬНЫЙ ПЕРИОД ИСТОРИЧЕСКИХ ДАННЫХ:
+• Для предсказания на 1-3 дня нужно минимум 7 дней (168 часов) истории
+• Оптимально: 14 дней для лучшей точности скользящих средних
+
+📥 ВХОДНЫЕ ДАННЫЕ ДЛЯ КАЖДОГО ЧАСА ПРЕДСКАЗАНИЯ:
+
+1️⃣ ВРЕМЕННЫЕ ПРИЗНАКИ:
+   • hour (0-23) - час предсказания
+   • dayofweek (0-6) - день недели
+   • month (1-12) - месяц
+
+2️⃣ ПОГОДНЫЕ ДАННЫЕ (на момент предсказания):
+   • temperature - температура (°C)
+   • humidity - влажность (%)
+   • wind_speed - скорость ветра (м/с)
+
+3️⃣ ИСТОРИЧЕСКИЕ ДАННЫЕ (обязательны!):
+   • consumption_lag_1,2,3,24,48,168 - потребление в прошлом
+   • consumption_rolling_mean/std_3,6,12,24 - скользящие средние
+
+4️⃣ КАЛЕНДАРНЫЕ ПРИЗНАКИ:
+   • is_holiday, is_working_day, is_weekend и т.д.
+
+⚠️ ВАЖНО:
+• Без исторических данных (лагов) точность будет низкой!
+• Для реальных предсказаний нужно либо иметь данные, либо использовать
+  пошаговое предсказание (каждый следующий час использует предыдущие предсказания)
+• Погодные данные должны быть прогнозом, не историей!
+
+🎯 ТОЧНОСТЬ:
+• Цель: MAE < 2.5% от среднего потребления
+• Требуется качественный прогноз погоды
+• Лучше всего работает для краткосрочных предсказаний (1-2 дня)
+""")
+
+if __name__ == "__main__":
+    explain_prediction_requirements()
+    retrospective_test()
+
