@@ -1,0 +1,321 @@
+text
+
+## 📊 Формат данных для предсказания с обученной моделью
+
+## 📁 Файл `prediction_interface.py` - как использовать модель:
+
+```python
+import pandas as pd
+import numpy as np
+from catboost import CatBoostRegressor
+from datetime import datetime, timedelta
+
+# === ИНТЕРФЕЙС ДЛЯ ПРЕДСКАЗАНИЯ ===
+
+class EnergyForecastInterface:
+    def __init__(self, model_path='energy_forecast_model.cbm'):
+        """Инициализация с загрузкой модели"""
+        self.model = CatBoostRegressor()
+        self.model.load_model(model_path)
+        print("✅ Модель загружена")
+    
+    def predict_next_hours(self, historical_data, weather_forecast, start_time, hours_ahead=24):
+        """
+        Предсказание на несколько часов вперед
+        
+        ПАРАМЕТРЫ:
+        -----------
+        historical_data : dict
+            Исторические данные за последние 7 дней
+            Формат: {
+                'datetime': список datetime,
+                'consumption': список значений потребления,
+                'temperature': список температур (опционально)
+            }
+        
+        weather_forecast : list of dict
+            Прогноз погоды на период предсказания
+            Формат: [
+                {'temperature': float, 'humidity': float, 'wind_speed': float},
+                ...
+            ]
+        
+        start_time : datetime
+            Время начала предсказания
+            
+        hours_ahead : int
+            Количество часов для предсказания (по умолчанию 24)
+        
+        ВОЗВРАЩАЕТ:
+        -----------
+        dict : {
+            'datetime': список времен предсказаний,
+            'predicted_consumption': список предсказанных значений
+        }
+        """
+        
+        # 1. Преобразуем исторические данные в DataFrame
+        df_history = pd.DataFrame({
+            'datetime': historical_data['datetime'],
+            'consumption': historical_data['consumption']
+        })
+        
+        # Добавляем погоду если есть
+        if 'temperature' in historical_data:
+            df_history['temperature'] = historical_data['temperature']
+        
+        df_history['datetime'] = pd.to_datetime(df_history['datetime'])
+        
+        # 2. Подготавливаем результаты
+        predictions = []
+        prediction_times = []
+        
+        # 3. Расширяем историю для пошагового предсказания
+        extended_history = df_history.copy()
+        
+        print(f"🚀 Начинаем предсказание с {start_time}")
+        print(f"📊 История: {len(extended_history)} записей")
+        print(f"⏰ Горизонт: {hours_ahead} часов")
+        
+        # 4. Последовательное предсказание
+        for i in range(hours_ahead):
+            current_time = start_time + timedelta(hours=i)
+            
+            # Получаем погоду (если есть, иначе дефолт)
+            if i < len(weather_forecast):
+                weather = weather_forecast[i]
+            else:
+                weather = {'temperature': 10.0, 'humidity': 70.0, 'wind_speed': 3.0}
+            
+            # Подготавливаем признаки
+            features = self._prepare_features(extended_history, current_time, weather)
+            
+            # Предсказание
+            pred_df = pd.DataFrame([features])
+            prediction = self.model.predict(pred_df)[0]
+            
+            # Сохраняем результат
+            predictions.append(prediction)
+            prediction_times.append(current_time)
+            
+            # Добавляем предсказание в историю для следующих шагов
+            new_row = {
+                'datetime': current_time,
+                'consumption': prediction,
+                'temperature': weather['temperature']
+            }
+            
+            extended_history = pd.concat([extended_history, pd.DataFrame([new_row])], ignore_index=True)
+            
+            print(f"   {current_time}: {prediction:.1f} МВт")
+        
+        return {
+            'datetime': prediction_times,
+            'predicted_consumption': predictions
+        }
+    
+    def _prepare_features(self, df_history, prediction_time, weather_data):
+        """Подготовка признаков для одного предсказания"""
+        
+        features = {
+            # Временные признаки
+            'hour': prediction_time.hour,
+            'dayofweek': prediction_time.weekday(),
+            'month': prediction_time.month,
+            
+            # Погодные данные
+            'temperature': weather_data.get('temperature', 10.0),
+            'humidity': weather_data.get('humidity', 70.0),
+            'wind_speed': weather_data.get('wind_speed', 3.0),
+        }
+        
+        # Лаговые признаки
+        for lag in [1, 2, 3, 24, 48, 168]:
+            lag_time = prediction_time - timedelta(hours=lag)
+            lag_data = df_history[df_history['datetime'] == lag_time]
+            
+            if len(lag_data) > 0:
+                features[f'consumption_lag_{lag}'] = lag_data['consumption'].iloc[0]
+            else:
+                features[f'consumption_lag_{lag}'] = df_history['consumption'].median()
+        
+        # Скользящие признаки
+        for window in [3, 6, 12, 24]:
+            recent_data = df_history[
+                df_history['datetime'] < prediction_time
+            ].tail(window)
+            
+            if len(recent_data) >= min(3, window):
+                features[f'consumption_rolling_mean_{window}'] = recent_data['consumption'].mean()
+                features[f'consumption_rolling_std_{window}'] = recent_data['consumption'].std()
+            else:
+                features[f'consumption_rolling_mean_{window}'] = df_history['consumption'].mean()
+                features[f'consumption_rolling_std_{window}'] = df_history['consumption'].std()
+        
+        # Категориальные признаки
+        features.update({
+            'is_holiday': 0,
+            'is_working_weekend': 0,
+            'is_regular_weekend': int(prediction_time.weekday() in [5, 6]),
+            'is_working_day': int(prediction_time.weekday() not in [5, 6]),
+            'is_weekend_or_holiday': int(prediction_time.weekday() in [5, 6]),
+            'is_weekend': int(prediction_time.weekday() in [5, 6]),
+        })
+        
+        return features
+
+# === ПРИМЕР ИСПОЛЬЗОВАНИЯ ===
+
+def example_usage():
+    """Пример использования интерфейса"""
+    
+    # 1. Загружаем модель
+    forecast = EnergyForecastInterface()
+    
+    # 2. Готовим исторические данные (последние 7 дней)
+    # ВАЖНО: нужны данные с 2025-09-05 00:00 по 2025-09-11 23:00
+    historical_data = {
+        'datetime': [
+            datetime(2025, 9, 11, 22, 0),
+            datetime(2025, 9, 11, 23, 0),
+            # ... добавьте все 168 записей (7 дней * 24 часа)
+        ],
+        'consumption': [
+            1200.5,  # МВт
+            1180.3,
+            # ... соответствующие значения потребления
+        ]
+    }
+    
+    # 3. Готовим прогноз погоды на 24 часа вперед
+    weather_forecast = [
+        {'temperature': 15.0, 'humidity': 65.0, 'wind_speed': 2.5},  # 2025-09-12 00:00
+        {'temperature': 14.5, 'humidity': 68.0, 'wind_speed': 3.0},  # 2025-09-12 01:00
+        # ... добавьте 24 записи
+    ]
+    
+    # 4. Время начала предсказания
+    start_time = datetime(2025, 9, 12, 0, 0)
+    
+    # 5. Выполняем предсказание
+    results = forecast.predict_next_hours(
+        historical_data=historical_data,
+        weather_forecast=weather_forecast,
+        start_time=start_time,
+        hours_ahead=24
+    )
+    
+    # 6. Выводим результаты
+    print("\n🎯 РЕЗУЛЬТАТЫ ПРЕДСКАЗАНИЯ:")
+    for dt, pred in zip(results['datetime'], results['predicted_consumption']):
+        print(f"{dt}: {pred:.1f} МВт")
+
+def explain_input_format():
+    """Объяснение формата входных данных"""
+    print("\n" + "="*70)
+    print("ФОРМАТ ВХОДНЫХ ДАННЫХ ДЛЯ ПРЕДСКАЗАНИЯ")
+    print("="*70)
+    
+    print("""
+    📊 ТРЕБУЕМЫЕ ДАННЫЕ:
+
+    1️⃣ ИСТОРИЧЕСКИЕ ДАННЫЕ (обязательно):
+       Период: последние 7 дней (168 часов)
+       Формат: 
+       {
+           'datetime': [datetime объекты],
+           'consumption': [значения в МВт],
+           'temperature': [опционально, температуры]
+       }
+
+    2️⃣ ПРОГНОЗ ПОГОДЫ (обязательно):
+       Период: на весь горизонт предсказания
+       Формат:
+       [
+           {'temperature': float, 'humidity': float, 'wind_speed': float},
+           ... (по одному dict на каждый час)
+       ]
+
+    3️⃣ ВРЕМЯ НАЧАЛА:
+       datetime объект - когда начинать предсказание
+
+    4️⃣ ГОРИЗОНТ ПРЕДСКАЗАНИЯ:
+       int - количество часов вперед (рекомендуется 1-48)
+
+    📈 ПРИМЕР ФОРМАТА:
+
+    historical_data = {
+        'datetime': [
+            datetime(2025, 9, 11, 22, 0),  # 22:00 11 сентября
+            datetime(2025, 9, 11, 23, 0),  # 23:00 11 сентября
+        ],
+        'consumption': [1200.5, 1180.3]
+    }
+
+    weather_forecast = [
+        {'temperature': 15.0, 'humidity': 65.0, 'wind_speed': 2.5},  # 00:00 12 сентября
+        {'temperature': 14.5, 'humidity': 68.0, 'wind_speed': 3.0},  # 01:00 12 сентября
+    ]
+
+    start_time = datetime(2025, 9, 12, 0, 0)  # Начинаем с 00:00 12 сентября
+    hours_ahead = 24  # Предсказываем на 24 часа вперед
+    """)
+
+if __name__ == "__main__":
+    explain_input_format()
+    # example_usage()  # Раскомментируйте для тестирования
+```
+
+## 📋 **Что нужно предоставить для предсказания:**
+
+### 📊 **1. Исторические данные (обязательно):**
+```python
+historical_data = {
+    'datetime': [datetime объекты за последние 7 дней],  # 168 записей
+    'consumption': [значения потребления в МВт],         # 168 значений
+    'temperature': [опционально, температуры]            # если есть
+}
+```
+
+### 🌡️ **2. Прогноз погоды (обязательно):**
+```python
+weather_forecast = [
+    {'temperature': 15.0, 'humidity': 65.0, 'wind_speed': 2.5},  # Час 1
+    {'temperature': 14.5, 'humidity': 68.0, 'wind_speed': 3.0},  # Час 2
+    # ... по одному dict на каждый час предсказания
+]
+```
+
+### ⏰ **3. Параметры предсказания:**
+```python
+start_time = datetime(2025, 9, 12, 0, 0)  # Когда начинать предсказание
+hours_ahead = 24  # Сколько часов предсказывать
+```
+
+## 🎯 **Рекомендуемый период:**
+- **Минимум**: 24 часа (1 день)
+- **Оптимально**: 48 часов (2 дня)  
+- **Максимум**: 72 часа (3 дня) - точность будет снижаться
+
+## 🚀 **Простой пример использования:**
+
+```python
+# Минимальный пример
+from datetime import datetime
+
+# Загружаем модель
+forecast = EnergyForecastInterface()
+
+# Предсказываем на 24 часа вперед
+results = forecast.predict_next_hours(
+    historical_data=ваш_исторический_датасет,
+    weather_forecast=ваш_прогноз_погоды,
+    start_time=datetime(2025, 9, 12, 0, 0),
+    hours_ahead=24
+)
+
+# Результаты
+print(results['predicted_consumption'])  # Список предсказанных значений
+```
+
+**Важно**: Чем больше исторических данных вы предоставите (но не меньше 168 часов), тем точнее будет предсказание!
