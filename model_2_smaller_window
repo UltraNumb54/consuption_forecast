@@ -1,0 +1,381 @@
+import pandas as pd
+import numpy as np
+from catboost import CatBoostRegressor
+import matplotlib.pyplot as plt
+from datetime import datetime, timedelta
+
+# === КОНСТАНТЫ ===
+MODEL_PATH = 'improved_energy_model.cbm'  # Используем улучшенную модель
+PROCESSED_DATA_FILE = 'processed_energy_data.csv'  # Все данные
+TEST_START_DATE = '2025-09-08'  # Тест с 8 сентября
+TEST_DAYS = 3
+HISTORICAL_WINDOW_DAYS = 180  # Используем максимум 180 дней истории вместо 6 лет
+
+def load_model():
+    """Загрузка обученной модели"""
+    model = CatBoostRegressor()
+    model.load_model(MODEL_PATH)
+    return model
+
+def get_model_explanation():
+    """Получение объяснения модели и важных признаков"""
+    print("=== ОБЪЯСНЕНИЕ МОДЕЛИ ===")
+    
+    model = load_model()
+    
+    # Загрузим данные для получения структуры признаков
+    df = pd.read_csv(PROCESSED_DATA_FILE)
+    df['datetime'] = pd.to_datetime(df['datetime'])
+    
+    # Подготовим тестовые признаки
+    numerical_features = [
+        'hour', 'dayofweek', 'month',
+        'temperature', 'humidity', 'wind_speed',
+        'consumption_lag_1', 'consumption_lag_2', 'consumption_lag_3',
+        'consumption_lag_24', 'consumption_lag_48', 'consumption_lag_168',
+        'consumption_rolling_mean_3', 'consumption_rolling_mean_6',
+        'consumption_rolling_mean_12', 'consumption_rolling_mean_24',
+        'consumption_rolling_std_3', 'consumption_rolling_std_6',
+        'consumption_rolling_std_12', 'consumption_rolling_std_24'
+    ]
+    
+    categorical_features = [
+        'is_holiday', 'is_working_weekend', 'is_regular_weekend',
+        'is_working_day', 'is_weekend_or_holiday', 'is_weekend'
+    ]
+    
+    feature_columns = numerical_features + categorical_features
+    
+    # Получим важность признаков
+    feature_importance = model.get_feature_importance()
+    feature_names = feature_columns  # или model.feature_names_ если доступно
+    
+    print("ТОП-15 самых важных признаков:")
+    importance_df = pd.DataFrame({
+        'feature': feature_names[:len(feature_importance)],
+        'importance': feature_importance
+    }).sort_values('importance', ascending=False)
+    
+    for i, row in importance_df.head(15).iterrows():
+        print(f"{i+1:2d}. {row['feature']}: {row['importance']:.2f}")
+    
+    # Визуализация важности признаков
+    plt.figure(figsize=(12, 8))
+    top_features = importance_df.head(15)
+    plt.barh(range(len(top_features)), top_features['importance'])
+    plt.yticks(range(len(top_features)), top_features['feature'])
+    plt.xlabel('Важность признаков')
+    plt.title('Топ-15 самых важных признаков модели')
+    plt.gca().invert_yaxis()
+    plt.tight_layout()
+    plt.savefig('feature_importance_analysis.png', dpi=300, bbox_inches='tight')
+    plt.show()
+    
+    return importance_df
+
+def prepare_features_with_explanation(df_historical, prediction_datetime, weather_data):
+    """Подготовка признаков с объяснением решений"""
+    print(f"\n--- Подготовка признаков для {prediction_datetime} ---")
+    
+    features = {
+        'hour': prediction_datetime.hour,
+        'dayofweek': prediction_datetime.weekday(),
+        'month': prediction_datetime.month,
+    }
+    print(f"Временные признаки: час={features['hour']}, день_недели={features['dayofweek']}, месяц={features['month']}")
+    
+    # Погодные данные
+    features.update({
+        'temperature': weather_data.get('temperature', 10.0),
+        'humidity': weather_data.get('humidity', 70.0),
+        'wind_speed': weather_data.get('wind_speed', 3.0),
+    })
+    print(f"Погода: температура={features['temperature']}, влажность={features['humidity']}, ветер={features['wind_speed']}")
+    
+    # Лаговые признаки с объяснением
+    print("Лаговые признаки:")
+    for lag in [1, 2, 3, 24, 48, 168]:
+        lag_time = prediction_datetime - timedelta(hours=lag)
+        lag_data = df_historical[df_historical['datetime'] == lag_time]
+        if len(lag_data) > 0:
+            features[f'consumption_lag_{lag}'] = lag_data['consumption'].iloc[0]
+            print(f"   lag_{lag}: {features[f'consumption_lag_{lag}']:.1f} МВт (в {lag_time})")
+        else:
+            features[f'consumption_lag_{lag}'] = df_historical['consumption'].median()
+            print(f"   lag_{lag}: медиана {features[f'consumption_lag_{lag}']:.1f} МВт (данные отсутствуют)")
+    
+    # Скользящие признаки
+    print("Скользящие признаки:")
+    for window in [3, 6, 12, 24]:
+        recent_data = df_historical[
+            df_historical['datetime'] < prediction_datetime
+        ].tail(window)
+        
+        if len(recent_data) >= min(3, window):
+            mean_val = recent_data['consumption'].mean()
+            std_val = recent_data['consumption'].std()
+            features[f'consumption_rolling_mean_{window}'] = mean_val
+            features[f'consumption_rolling_std_{window}'] = std_val
+            print(f"   rolling_mean_{window}: {mean_val:.1f} МВт (std={std_val:.1f})")
+        else:
+            mean_val = df_historical['consumption'].mean()
+            std_val = df_historical['consumption'].std()
+            features[f'consumption_rolling_mean_{window}'] = mean_val
+            features[f'consumption_rolling_std_{window}'] = std_val
+            print(f"   rolling_mean_{window}: общая средняя {mean_val:.1f} МВт (мало данных)")
+    
+    # Календарные признаки
+    features.update({
+        'is_holiday': 0,
+        'is_working_day': int(prediction_datetime.weekday() not in [5, 6]),
+        'is_weekend': int(prediction_datetime.weekday() in [5, 6]),
+        'is_weekend_or_holiday': int(prediction_datetime.weekday() in [5, 6]),
+    })
+    print(f"Календарь: выходной={features['is_weekend']}, рабочий_день={features['is_working_day']}")
+    
+    return features
+
+def retrospective_test_with_analysis():
+    """Ретроспективное тестирование с анализом и ограничением истории"""
+    
+    print("=== РАСШИРЕННОЕ РЕТРОСПЕКТИВНОЕ ТЕСТИРОВАНИЕ ===")
+    
+    # Загрузка модели
+    model = load_model()
+    print("Модель загружена")
+    
+    # Загрузка исторических данных
+    df_historical = pd.read_csv(PROCESSED_DATA_FILE)
+    df_historical['datetime'] = pd.to_datetime(df_historical['datetime'])
+    df_historical['date_only'] = df_historical['datetime'].dt.date
+    print(f"Исторические данные загружены: {len(df_historical)} записей")
+    print(f"   Период: {df_historical['datetime'].min()} - {df_historical['datetime'].max()}")
+    
+    # Определяем период тестирования
+    test_start = datetime.strptime(TEST_START_DATE, '%Y-%m-%d')
+    test_end = test_start + timedelta(days=TEST_DAYS)
+    
+    print(f"Тестирование с {test_start} по {test_end}")
+    
+    # Фильтруем данные до тестового периода с ограничением истории
+    max_history_date = test_start - timedelta(days=HISTORICAL_WINDOW_DAYS)
+    training_data = df_historical[
+        (df_historical['datetime'] < test_start) & 
+        (df_historical['datetime'] >= max_history_date)
+    ]
+    
+    test_data = df_historical[
+        (df_historical['datetime'] >= test_start) & 
+        (df_historical['datetime'] < test_end)
+    ]
+    
+    print(f"Данные для обучения признаков: {len(training_data)} записей")
+    print(f"Период: {training_data['datetime'].min()} - {training_data['datetime'].max()}")
+    print(f"Используется максимум {HISTORICAL_WINDOW_DAYS} дней истории")
+    print(f"Тестовые данные: {len(test_data)} записей")
+    
+    if len(test_data) == 0:
+        print("Нет тестовых данных!")
+        return
+    
+    # Подготовка предсказаний с детальным анализом
+    predictions = []
+    actual_values = []
+    prediction_times = []
+    feature_importance_tracking = []  # Для отслеживания признаков
+    
+    print(f"\nНАЧАЛО ПРЕДСКАЗАНИЙ ({len(test_data)} точек)...")
+    
+    # Первое предсказание с подробным объяснением
+    first_prediction = True
+    
+    for idx, row in test_data.iterrows():
+        prediction_time = row['datetime']
+        actual_consumption = row['consumption']
+        
+        # Подготовка погодных данных
+        weather_data = {
+            'temperature': row.get('temperature', 10.0),
+            'humidity': row.get('humidity', 70.0),
+            'wind_speed': row.get('wind_speed', 3.0),
+        }
+        
+        # Подготовка признаков
+        if first_prediction:
+            print(f"\n📝 ПЕРВОЕ ПРЕДСКАЗАНИЕ С ПОДРОБНЫМ АНАЛИЗОМ:")
+            features = prepare_features_with_explanation(training_data, prediction_time, weather_data)
+            first_prediction = False
+        else:
+            features = prepare_features_with_explanation(training_data, prediction_time, weather_data)
+        
+        # Создание DataFrame для предсказания
+        features_df = pd.DataFrame([features])
+        
+        # Обработка пропусков
+        for col in features_df.columns:
+            if features_df[col].isna().any():
+                if col in training_data.columns:
+                    median_val = training_data[col].median()
+                    features_df[col] = features_df[col].fillna(median_val)
+                else:
+                    features_df[col] = features_df[col].fillna(0)
+        
+        # Выполнение предсказания
+        try:
+            prediction = model.predict(features_df)[0]
+            predictions.append(prediction)
+            actual_values.append(actual_consumption)
+            prediction_times.append(prediction_time)
+            
+            # Отслеживаем важные признаки для анализа
+            feature_tracking = {
+                'datetime': prediction_time,
+                'actual': actual_consumption,
+                'predicted': prediction,
+                'error': abs(prediction - actual_consumption),
+                'lag_1': features.get('consumption_lag_1', 0),
+                'temperature': features.get('temperature', 0),
+                'hour': features.get('hour', 0)
+            }
+            feature_importance_tracking.append(feature_tracking)
+            
+            if len(predictions) <= 5 or len(predictions) % 24 == 0:  # Показываем первые 5 и каждый новый день
+                print(f"   {prediction_time}: предсказано {prediction:.1f}, реально {actual_consumption:.1f}, ошибка {abs(prediction - actual_consumption):.1f}")
+            
+        except Exception as e:
+            print(f"Ошибка при предсказании {prediction_time}: {e}")
+            continue
+    
+    # Оценка качества
+    if len(predictions) > 0:
+        from sklearn.metrics import mean_absolute_error, mean_absolute_percentage_error
+        
+        mae = mean_absolute_error(actual_values, predictions)
+        mape = mean_absolute_percentage_error(actual_values, predictions) * 100
+        
+        print(f"\n" + "="*60)
+        print("РЕЗУЛЬТАТЫ ТЕСТИРОВАНИЯ")
+        print("="*60)
+        print(f"Количество предсказаний: {len(predictions)}")
+        print(f"MAE: {mae:.3f}")
+        print(f"MAPE: {mape:.2f}%")
+        print(f"Среднее потребление: {np.mean(actual_values):.1f} МВт")
+        print(f"Точность (±2.5% от среднего): {mae < (np.mean(actual_values) * 0.025)}")
+        print(f"Коэффициент точности: {100 - mape:.1f}%")
+        
+        # Анализ ошибок
+        errors = np.abs(np.array(actual_values) - np.array(predictions))
+        print(f"\n📉 АНАЛИЗ ОШИБОК:")
+        print(f"   Минимальная ошибка: {np.min(errors):.1f} МВт")
+        print(f"   Максимальная ошибка: {np.max(errors):.1f} МВт")
+        print(f"   Медианная ошибка: {np.median(errors):.1f} МВт")
+        print(f"   Стандартное отклонение ошибок: {np.std(errors):.1f} МВт")
+        
+        # Визуализация результатов
+        plt.figure(figsize=(20, 12))
+        
+        # График 1: Предсказания vs Реальные значения
+        plt.subplot(3, 2, 1)
+        plt.plot(prediction_times, actual_values, 'b-', label='Реальное', linewidth=2, alpha=0.8)
+        plt.plot(prediction_times, predictions, 'r--', label='Предсказанное', linewidth=2, alpha=0.8)
+        plt.title(f'Предсказания vs Реальные значения\nMAE={mae:.3f}, MAPE={mape:.2f}%')
+        plt.ylabel('Потребление (МВт)')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        
+        # График 2: Абсолютные ошибки
+        plt.subplot(3, 2, 2)
+        plt.plot(prediction_times, errors, 'g-', alpha=0.7)
+        plt.title(f'Абсолютные ошибки (средняя = {np.mean(errors):.1f} МВт)')
+        plt.ylabel('Ошибка (МВт)')
+        plt.xlabel('Время')
+        plt.grid(True, alpha=0.3)
+        
+        # График 3: Scatter plot
+        plt.subplot(3, 2, 3)
+        plt.scatter(actual_values, predictions, alpha=0.6)
+        min_val = min(min(actual_values), min(predictions))
+        max_val = max(max(actual_values), max(predictions))
+        plt.plot([min_val, max_val], [min_val, max_val], 'r--', alpha=0.8)
+        plt.xlabel('Реальное значение')
+        plt.ylabel('Предсказанное значение')
+        plt.title('Корреляция предсказаний и реальных значений')
+        plt.grid(True, alpha=0.3)
+        
+        # График 4: Ошибки по часам
+        plt.subplot(3, 2, 4)
+        df_errors = pd.DataFrame({
+            'hour': [t.hour for t in prediction_times],
+            'error': errors
+        })
+        hourly_errors = df_errors.groupby('hour')['error'].mean()
+        plt.bar(hourly_errors.index, hourly_errors.values, alpha=0.7)
+        plt.xlabel('Час суток')
+        plt.ylabel('Средняя ошибка (МВт)')
+        plt.title('Средние ошибки по часам суток')
+        plt.grid(True, alpha=0.3)
+        
+        # График 5: Анализ лагов
+        plt.subplot(3, 2, 5)
+        lag_errors = pd.DataFrame(feature_importance_tracking)
+        plt.scatter(lag_errors['lag_1'], lag_errors['actual'], alpha=0.5, label='Реальное')
+        plt.scatter(lag_errors['lag_1'], lag_errors['predicted'], alpha=0.5, label='Предсказанное')
+        plt.xlabel('Потребление 1 час назад (МВт)')
+        plt.ylabel('Потребление (МВт)')
+        plt.title('Связь с предыдущим часом')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        
+        # График 6: Температура vs Ошибка
+        plt.subplot(3, 2, 6)
+        plt.scatter(lag_errors['temperature'], lag_errors['error'], alpha=0.5)
+        plt.xlabel('Температура (°C)')
+        plt.ylabel('Ошибка (МВт)')
+        plt.title('Зависимость ошибки от температуры')
+        plt.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.savefig('enhanced_test_results.png', dpi=300, bbox_inches='tight')
+        plt.show()
+        
+        # Сохранение детальных результатов
+        results_df = pd.DataFrame({
+            'datetime': prediction_times,
+            'actual_consumption': actual_values,
+            'predicted_consumption': predictions,
+            'absolute_error': errors
+        })
+        results_df.to_csv('enhanced_test_detailed_results.csv', index=False)
+        print(f"\nДетальные результаты сохранены в enhanced_test_detailed_results.csv")
+        
+        # Анализ по дням
+        print(f"\nАНАЛИЗ ПО ДНЯМ:")
+        df_daily = pd.DataFrame({
+            'datetime': prediction_times,
+            'actual': actual_values,
+            'predicted': predictions,
+            'error': errors
+        })
+        df_daily['date'] = [t.date() for t in df_daily['datetime']]
+        
+        daily_stats = df_daily.groupby('date').agg({
+            'actual': ['mean', 'std'],
+            'predicted': 'mean',
+            'error': ['mean', 'std']
+        }).round(2)
+        
+        print("Дневная статистика:")
+        print(daily_stats)
+        
+    else:
+        print("Не удалось выполнить ни одного предсказания!")
+
+
+if __name__ == "__main__":
+    # Выполняем расширенное тестирование
+    retrospective_test_with_analysis()
+    
+    # Выводим рекомендации
+    explain_improvements_and_recommendations()
+    
+    print(f"\n✅ АНАЛИЗ ЗАВЕРШЕН!")
