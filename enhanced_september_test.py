@@ -8,9 +8,8 @@ from datetime import datetime, timedelta
 # === КОНСТАНТЫ ===
 MODEL_PATH = 'enhanced_energy_model.cbm'
 FULL_DATA_FILE = 'enhanced_filtered_full_data.csv'  # Полный датасет, включая сентябрь 2025
-FEATURES_LIST_FILE = 'model_feature_columns.pkl'    # Файл со списком признаков (сохраняется при обучении)
 TEST_START_DATE = '2025-09-01'
-TEST_DAYS = 3  # Прогноз на 3 дня вперед
+TEST_DAYS = 3  # Прогноз на 3 дня вперед (как требовалось в ТЗ)
 
 def load_model():
     """Загрузка обученной модели"""
@@ -26,16 +25,15 @@ def simple_september_test():
     # Загружаем модель
     model = load_model()
     
+    # Извлекаем список признаков прямо из модели (НЕ нужно отдельного файла!)
+    feature_columns = model.feature_names_
+    print(f"Модель обучалась на {len(feature_columns)} признаках")
+
     # Загружаем полный датасет (с сентября 2025)
     df_full = pd.read_csv(FULL_DATA_FILE)
     df_full['datetime'] = pd.to_datetime(df_full['datetime'])
     print(f"Полный датасет загружен: {len(df_full)} записей")
     print(f"Период данных: {df_full['datetime'].min()} - {df_full['datetime'].max()}")
-
-    # Загружаем список признаков, на которых обучалась модель
-    import joblib
-    feature_columns = joblib.load(FEATURES_LIST_FILE)
-    print(f"Загружено {len(feature_columns)} признаков для модели")
 
     # Определяем период тестирования
     test_start = datetime.strptime(TEST_START_DATE, '%Y-%m-%d')
@@ -58,7 +56,8 @@ def simple_september_test():
     # Проверяем, что все колонки присутствуют
     missing_cols = [col for col in feature_columns if col not in X_test.columns]
     if missing_cols:
-        print(f"Критическая ошибка: Отсутствуют колонки: {missing_cols}")
+        print(f"Критическая ошибка: В датасете отсутствуют колонки: {missing_cols}")
+        print("Проверьте, что enhanced_filtered_full_data.csv содержит все признаки из enhanced_filtered_training_data.csv")
         return
 
     # Делаем предсказание
@@ -70,7 +69,7 @@ def simple_september_test():
     mape = mean_absolute_percentage_error(y_test, predictions) * 100
     mean_actual = np.mean(y_test)
 
-    print(f"\n===ИТОГОВЫЕ РЕЗУЛЬТАТЫ ===")
+    print(f"\n=== ИТОГОВЫЕ РЕЗУЛЬТАТЫ ===")
     print(f"Количество предсказаний: {len(predictions)}")
     print(f"MAE: {mae:.3f}")
     print(f"MAPE: {mape:.2f}%")
