@@ -44,7 +44,7 @@ def train_model_with_optimization():
     # Проверяем, что все колонки существуют
     missing_cols = [col for col in feature_columns if col not in df.columns]
     if missing_cols:
-        print(f"Предупреждение: следующие колонки отсутствуют в данных: {missing_cols}")
+        print(f"⚠️  Предупреждение: следующие колонки отсутствуют в данных: {missing_cols}")
         feature_columns = [col for col in feature_columns if col in df.columns]
 
     X = df[feature_columns]
@@ -66,7 +66,7 @@ def train_model_with_optimization():
 
     # Сетка гиперпараметров (можно расширить)
     param_grid = {
-        'iterations': [500],          # Для скорости оставим 500, можно добавить [1000]
+        'iterations': [500],          # Для скорости оставим 500
         'learning_rate': [0.05, 0.1],
         'depth': [6, 8],
         'l2_leaf_reg': [3, 5],
@@ -81,7 +81,7 @@ def train_model_with_optimization():
     )
 
     # Поиск лучших параметров с ПРОГРЕСС-БАРОМ (verbose=2)
-    print("\nНачинаем подбор гиперпараметров...")
+    print("\n🔍 Начинаем подбор гиперпараметров...")
     print("Это может занять несколько минут. Пожалуйста, подождите...")
     grid_search = GridSearchCV(
         estimator=model,
@@ -94,32 +94,54 @@ def train_model_with_optimization():
 
     grid_search.fit(X, y)
 
-    print(f"\nЛучшие параметры: {grid_search.best_params_}")
-    print(f"📈 Лучший MAPE на кросс-валидации: {-grid_search.best_score_:.4f}")
+    print(f"\n🏆 Лучшие параметры: {grid_search.best_params_}")
+    # Исправлено: -grid_search.best_score_ даст ПОЛОЖИТЕЛЬНЫЙ MAPE
+    print(f"📈 Лучший MAPE на кросс-валидации: {-grid_search.best_score_:.4f} (или {(-grid_search.best_score_)*100:.2f}%)")
+
+    # ===== ИСПРАВЛЕНИЕ ОШИБКИ use_best_model =====
+    # Разделяем данные на финальные train/val (80/20) для обучения с early stopping
+    split_idx = int(len(X) * 0.8)
+    X_train_final = X.iloc[:split_idx]
+    y_train_final = y.iloc[:split_idx]
+    X_val_final = X.iloc[split_idx:]
+    y_val_final = y.iloc[split_idx:]
 
     # Обучаем финальную модель на лучших параметрах с ПРОГРЕСС-БАРОМ
-    print("\nОбучение финальной модели с лучшими параметрами...")
+    print("\n🚀 Обучение финальной модели с лучшими параметрами...")
     best_model = CatBoostRegressor(
         **grid_search.best_params_,
         loss_function='MAPE',
+        eval_metric='MAPE',  # Для красивого вывода в прогресс-баре
         cat_features=categorical_features,
         early_stopping_rounds=30,  # Предотвращение переобучения
         use_best_model=True,       # Использовать лучшую итерацию
         verbose=50                 # <-- ПРОГРЕСС-БАР! Вывод каждые 50 итераций
     )
 
-    best_model.fit(X, y)
+    # ОБЯЗАТЕЛЬНО передаем eval_set!
+    best_model.fit(
+        X_train_final, y_train_final,
+        eval_set=(X_val_final, y_val_final)  # <-- КЛЮЧЕВОЕ ИЗМЕНЕНИЕ!
+    )
+    # =============================================
 
     # Оценка на всем датасете (для информации)
     y_pred_full = best_model.predict(X)
     mae_full = mean_absolute_error(y, y_pred_full)
     mape_full = mean_absolute_percentage_error(y, y_pred_full) * 100
-    print(f"\nОценка на всем обучающем наборе:")
-    print(f"MAE: {mae_full:.3f}")
-    print(f"MAPE: {mape_full:.2f}%")
+    print(f"\n📊 Оценка на всем обучающем наборе:")
+    print(f"   MAE: {mae_full:.3f}")
+    print(f"   MAPE: {mape_full:.2f}%")
 
-    # Анализ переобучения (если есть валидационный набор, но здесь его нет)
-    # Вместо этого выводим важность признаков
+    # Анализ переобучения (сравниваем ошибку на train и val)
+    y_pred_train = best_model.predict(X_train_final)
+    y_pred_val = best_model.predict(X_val_final)
+    mae_train = mean_absolute_error(y_train_final, y_pred_train)
+    mae_val = mean_absolute_error(y_val_final, y_pred_val)
+    overfitting_ratio = mae_val / mae_train if mae_train > 0 else float('inf')
+    print(f"\n⚠️  Коэффициент переобучения (MAE val / MAE train): {overfitting_ratio:.2f}")
+
+    # Вывод важности признаков
     print(f"\n=== ТОП-15 САМЫХ ВАЖНЫХ ПРИЗНАКОВ ===")
     feature_importance = pd.DataFrame({
         'feature': X.columns,
@@ -131,9 +153,9 @@ def train_model_with_optimization():
 
     # Сохраняем модель
     best_model.save_model(MODEL_PATH)
-    print(f"\nМодель успешно сохранена в {MODEL_PATH}")
+    print(f"\n✅ Модель успешно сохранена в {MODEL_PATH}")
 
-    # Опционально: сохраняем график важности признаков
+    # Сохраняем график важности признаков
     try:
         import matplotlib.pyplot as plt
         plt.figure(figsize=(10, 8))
@@ -145,12 +167,12 @@ def train_model_with_optimization():
         plt.gca().invert_yaxis()
         plt.tight_layout()
         plt.savefig(FEATURES_IMPORTANCE_PATH, dpi=300, bbox_inches='tight')
-        print(f"График важности признаков сохранен в {FEATURES_IMPORTANCE_PATH}")
+        print(f"📊 График важности признаков сохранен в {FEATURES_IMPORTANCE_PATH}")
     except Exception as e:
-        print(f"Не удалось сохранить график важности признаков: {e}")
+        print(f"⚠️  Не удалось сохранить график важности признаков: {e}")
 
     return best_model, feature_columns
 
 if __name__ == "__main__":
     model, features = train_model_with_optimization()
-    print("\nОбучение завершено успешно")
+    print("\n🎉 Обучение завершено успешно!")
