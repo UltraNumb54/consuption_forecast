@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 CONSUMPTION_FILE = 'consumption_data.csv'
 WEATHER_FILE = 'weather_data.csv'
 CALENDAR_FILE = 'russian_production_calendar_2017_2025.csv'
-OUTPUT_FILE = 'enhanced_processed_energy_data.csv'  # Изменено имя выходного файла
+OUTPUT_FILE = 'enhanced_processed_energy_data.csv'
 
 def preprocess_consumption_data():
     """Предобработка данных по потреблению"""
@@ -33,26 +33,27 @@ def preprocess_consumption_data():
     df_consumption['dayofweek'] = df_consumption['datetime'].dt.dayofweek
     df_consumption['month'] = df_consumption['datetime'].dt.month
     df_consumption['year'] = df_consumption['datetime'].dt.year
-    df_consumption['week_of_year'] = df_consumption['datetime'].dt.isocalendar().week  # НОВЫЙ ПРИЗНАК: Номер недели
+    df_consumption['week_of_year'] = df_consumption['datetime'].dt.isocalendar().week
     
-    # Циклические признаки для часа (НОВЫЙ ПРИЗНАК)
+    # Циклические признаки для часа
     df_consumption['hour_sin'] = np.sin(2 * np.pi * df_consumption['hour'] / 24)
     df_consumption['hour_cos'] = np.cos(2 * np.pi * df_consumption['hour'] / 24)
     
-    # Признак времени года (НОВЫЙ ПРИЗНАК)
-    df_consumption['season'] = df_consumption['month'] % 12 // 3 + 1  # 1: зима, 2: весна, 3: лето, 4: осень
+    # Признак времени года
+    df_consumption['season'] = df_consumption['month'] % 12 // 3 + 1
     df_consumption['is_winter'] = (df_consumption['season'] == 1).astype(int)
     df_consumption['is_spring'] = (df_consumption['season'] == 2).astype(int)
     df_consumption['is_summer'] = (df_consumption['season'] == 3).astype(int)
     df_consumption['is_autumn'] = (df_consumption['season'] == 4).astype(int)
     
+    # Исправлено: astype(int) на булевом Series - это нормально, игнорируем предупреждение IDE
     df_consumption['is_weekend'] = df_consumption['dayofweek'].isin([5, 6]).astype(int)
 
     print(f"Данные по потреблению обработаны. Размер: {len(df_consumption)}")
     return df_consumption
 
 def preprocess_weather_data():
-    """Предобработка данных по погоде (БЕЗ температуры!)"""
+    """Предобработка данных по погоде (без температуры)"""
     print("Загрузка данных по погоде...")
     try:
         with open(WEATHER_FILE, 'r', encoding='utf-8') as f:
@@ -111,7 +112,7 @@ def preprocess_weather_data():
             print(f"Ошибка при преобразовании даты: {e}")
             return None
 
-    # Берем ТОЛЬКО влажность и ветер. Температура (T) НЕ БЕРЕТСЯ.
+    # Берем только влажность и ветер. Температура (T) не берётся.
     required_columns = ['datetime', 'U', 'Ff']
     existing_columns = [col for col in required_columns if col in df_weather.columns]
     if len(existing_columns) < 2:
@@ -139,23 +140,35 @@ def load_calendar():
         print(f"Ошибка: Файл {CALENDAR_FILE} не найден!")
         return None
 
-def create_lag_features(df, lag_hours=[1, 2, 3, 24, 48, 72, 120, 168]):  # ДОБАВЛЕНЫ 72 и 120
+# Замена изменяемых значений по умолчанию (list) на None
+def create_lag_features(df, lag_hours=None):
     """Создание лаговых признаков"""
+    if lag_hours is None:
+        lag_hours = [1, 2, 3, 24, 48, 72, 120, 168]  # Создается НОВЫЙ список при каждом вызове
+    
     print("Создание лаговых признаков...")
     for lag in lag_hours:
         df[f'consumption_lag_{lag}'] = df['consumption'].shift(lag)
     return df
 
-def create_rolling_features(df, windows=[3, 6, 12, 24, 720]):  # ДОБАВЛЕНО 720 (30 дней)
+# Замена изменяемых значений по умолчанию (list) на None
+def create_rolling_features(df, windows=None):
     """Создание скользящих признаков (среднее и стандартное отклонение)"""
+    if windows is None:
+        windows = [3, 6, 12, 24, 720]  # Создается НОВЫЙ список при каждом вызове
+    
     print("Создание скользящих признаков...")
     for window in windows:
         df[f'consumption_rolling_mean_{window}'] = df['consumption'].rolling(window=window).mean()
         df[f'consumption_rolling_std_{window}'] = df['consumption'].rolling(window=window).std()
     return df
 
-def create_ewm_features(df, spans=[3, 6, 12, 24]):  # НОВАЯ ФУНКЦИЯ: Экспоненциальное сглаживание
+# Замена изменяемых значений по умолчанию (list) на None
+def create_ewm_features(df, spans=None):
     """Создание признаков экспоненциального сглаживания"""
+    if spans is None:
+        spans = [3, 6, 12, 24]  # Создается НОВЫЙ список при каждом вызове
+    
     print("Создание признаков экспоненциального сглаживания...")
     for span in spans:
         df[f'consumption_ewm_mean_{span}'] = df['consumption'].ewm(span=span).mean()
@@ -197,14 +210,14 @@ def main():
     df_final = df_final.sort_values('datetime')
     df_final = create_lag_features(df_final)
     df_final = create_rolling_features(df_final)
-    df_final = create_ewm_features(df_final)  # ДОБАВЛЕНО
+    df_final = create_ewm_features(df_final)
 
     initial_size = len(df_final)
     df_final = df_final.dropna()
     final_size = len(df_final)
     print(f"Удалено строк с пропусками: {initial_size - final_size}")
 
-    columns_to_drop = ['date_for_merge_x', 'date_for_merge_y', 'T']  # Удаляем лишнее
+    columns_to_drop = ['date_for_merge_x', 'date_for_merge_y', 'T']
     df_final = df_final.drop(columns=[col for col in columns_to_drop if col in df_final.columns])
 
     df_final.to_csv(OUTPUT_FILE, index=False)
