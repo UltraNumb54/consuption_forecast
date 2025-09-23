@@ -9,7 +9,7 @@ MODEL_PATH = 'improved_energy_model.cbm'
 PROCESSED_DATA_FILE = 'processed_energy_data.csv'
 TEST_START_DATE = '2025-09-08'
 TEST_DAYS = 3
-HISTORICAL_WINDOW_DAYS = 180
+HISTORICAL_WINDOW_DAYS = 14  # Достаточно 14 дней
 
 def load_model():
     """Загрузка обученной модели"""
@@ -17,17 +17,41 @@ def load_model():
     model.load_model(MODEL_PATH)
     return model
 
+def get_model_feature_info():
+    """Получение информации о признаках модели"""
+    # Загрузим модель и создадим тестовый датасет для получения структуры
+    model = load_model()
+    
+    # Определяем структуру признаков как при обучении
+    numerical_features = [
+        'hour', 'dayofweek', 'month',
+        'temperature', 'humidity', 'wind_speed',
+        'consumption_lag_1', 'consumption_lag_2', 'consumption_lag_3',
+        'consumption_lag_24', 'consumption_lag_48', 'consumption_lag_168',
+        'consumption_rolling_mean_3', 'consumption_rolling_mean_6',
+        'consumption_rolling_mean_12', 'consumption_rolling_mean_24',
+        'consumption_rolling_std_3', 'consumption_rolling_std_6',
+        'consumption_rolling_std_12', 'consumption_rolling_std_24'
+    ]
+    
+    categorical_features = [
+        'is_holiday', 'is_working_weekend', 'is_regular_weekend',
+        'is_working_day', 'is_weekend_or_holiday', 'is_weekend'
+    ]
+    
+    return numerical_features, categorical_features
+
 def prepare_features_for_prediction(df_historical, prediction_datetime, weather_data):
     """Подготовка признаков для одного предсказания"""
     
-    # Базовые временные признаки
+    # Базовые временные признаки (целые числа для категориальных)
     features = {
-        'hour': float(prediction_datetime.hour),
-        'dayofweek': float(prediction_datetime.weekday()),
-        'month': float(prediction_datetime.month),
+        'hour': int(prediction_datetime.hour),
+        'dayofweek': int(prediction_datetime.weekday()),
+        'month': int(prediction_datetime.month),
     }
     
-    # Погодные данные
+    # Погодные данные (вещественные числа)
     features.update({
         'temperature': float(weather_data.get('temperature', 10.0)),
         'humidity': float(weather_data.get('humidity', 70.0)),
@@ -60,22 +84,29 @@ def prepare_features_for_prediction(df_historical, prediction_datetime, weather_
             features[f'consumption_rolling_mean_{window}'] = mean_val
             features[f'consumption_rolling_std_{window}'] = std_val
     
-    # Календарные признаки
+    # Календарные признаки (целые числа 0 или 1)
     features.update({
-        'is_holiday': 0.0,
-        'is_working_weekend': 0.0,
-        'is_regular_weekend': float(prediction_datetime.weekday() in [5, 6]),
-        'is_working_day': float(prediction_datetime.weekday() not in [5, 6]),
-        'is_weekend_or_holiday': float(prediction_datetime.weekday() in [5, 6]),
-        'is_weekend': float(prediction_datetime.weekday() in [5, 6]),
+        'is_holiday': int(0),
+        'is_working_weekend': int(0),
+        'is_regular_weekend': int(prediction_datetime.weekday() in [5, 6]),
+        'is_working_day': int(prediction_datetime.weekday() not in [5, 6]),
+        'is_weekend_or_holiday': int(prediction_datetime.weekday() in [5, 6]),
+        'is_weekend': int(prediction_datetime.weekday() in [5, 6]),
     })
     
     return features
 
-def september_prediction():
-    """Предсказание для сентября 2025"""
+def september_prediction_fixed():
+    """Исправленное предсказание для сентября 2025"""
     
-    print("=== ПРЕДСКАЗАНИЕ ДЛЯ СЕНТЯБРЯ 2025 ===")
+    print("=== ИСПРАВЛЕННОЕ ПРЕДСКАЗАНИЕ ДЛЯ СЕНТЯБРЯ 2025 ===")
+    
+    # Получаем информацию о признаках
+    numerical_features, categorical_features = get_model_feature_info()
+    all_features = numerical_features + categorical_features
+    
+    print(f"Числовые признаки: {len(numerical_features)}")
+    print(f"Категориальные признаки: {len(categorical_features)}")
     
     # Загрузка модели
     model = load_model()
@@ -84,7 +115,6 @@ def september_prediction():
     # Загрузка исторических данных
     df_historical = pd.read_csv(PROCESSED_DATA_FILE)
     df_historical['datetime'] = pd.to_datetime(df_historical['datetime'])
-    df_historical['date_only'] = df_historical['datetime'].dt.date
     print(f"Исторические данные: {len(df_historical)} записей")
     
     # Определяем период тестирования
@@ -93,7 +123,7 @@ def september_prediction():
     
     print(f"Тестирование с {test_start} по {test_end}")
     
-    # Фильтруем данные с ограничением истории
+    # Фильтруем данные
     max_history_date = test_start - timedelta(days=HISTORICAL_WINDOW_DAYS)
     training_data = df_historical[
         (df_historical['datetime'] < test_start) & 
@@ -105,7 +135,7 @@ def september_prediction():
         (df_historical['datetime'] < test_end)
     ]
     
-    print(f"Обучающие данные: {len(training_data)} записей")
+    print(f"Обучающие данные: {len(training_data)} записей ({HISTORICAL_WINDOW_DAYS} дней)")
     print(f"Тестовые данные: {len(test_data)} записей")
     
     if len(test_data) == 0:
@@ -136,13 +166,16 @@ def september_prediction():
         # Подготовка признаков
         features = prepare_features_for_prediction(extended_history, prediction_time, weather_data)
         
-        # Создание DataFrame с правильными колонками
-        feature_columns = list(features.keys())
-        features_df = pd.DataFrame([features])
+        # Создание DataFrame с правильным порядком колонок
+        features_dict = {col: features.get(col, 0) for col in all_features}
+        features_df = pd.DataFrame([features_dict])
         
-        # Убедимся, что все значения числовые
+        # Убеждаемся в правильных типах данных
         for col in features_df.columns:
-            features_df[col] = pd.to_numeric(features_df[col], errors='coerce').fillna(0.0)
+            if col in categorical_features:
+                features_df[col] = features_df[col].astype(int)
+            else:
+                features_df[col] = pd.to_numeric(features_df[col], errors='coerce').fillna(0.0)
         
         # Выполнение предсказания
         try:
@@ -157,17 +190,15 @@ def september_prediction():
             new_row = {
                 'datetime': prediction_time,
                 'consumption': float(prediction),
-                'hour': prediction_time.hour,
-                'dayofweek': prediction_time.weekday(),
-                'month': prediction_time.month,
-                'temperature': weather_data['temperature'],
-                'humidity': weather_data['humidity'],
-                'wind_speed': weather_data['wind_speed']
+                'hour': int(prediction_time.hour),
+                'dayofweek': int(prediction_time.weekday()),
+                'month': int(prediction_time.month),
+                'temperature': float(weather_data['temperature'])
             }
             
             # Копируем другие доступные колонки
             for col in extended_history.columns:
-                if col not in new_row and col in row:
+                if col not in new_row and col in row and pd.notna(row[col]):
                     new_row[col] = row[col]
             
             new_row_df = pd.DataFrame([new_row])
@@ -175,6 +206,8 @@ def september_prediction():
             
         except Exception as e:
             print(f"Ошибка при предсказании {prediction_time}: {e}")
+            print(f"Признаки: {list(features_df.columns)}")
+            print(f"Типы: {features_df.dtypes}")
             continue
     
     # Оценка качества
@@ -228,4 +261,4 @@ def september_prediction():
         print("Не удалось выполнить ни одного предсказания!")
 
 if __name__ == "__main__":
-    september_prediction()
+    september_prediction_fixed()
