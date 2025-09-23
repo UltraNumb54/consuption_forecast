@@ -9,7 +9,7 @@ MODEL_PATH = 'improved_energy_model.cbm'
 PROCESSED_DATA_FILE = 'processed_energy_data.csv'
 TEST_START_DATE = '2025-09-08'
 TEST_DAYS = 3
-HISTORICAL_WINDOW_DAYS = 14  # Достаточно 14 дней
+HISTORICAL_WINDOW_DAYS = 14
 
 def load_model():
     """Загрузка обученной модели"""
@@ -17,46 +17,21 @@ def load_model():
     model.load_model(MODEL_PATH)
     return model
 
-def get_model_feature_info():
-    """Получение информации о признаках модели"""
-    # Загрузим модель и создадим тестовый датасет для получения структуры
-    model = load_model()
-    
-    # Определяем структуру признаков как при обучении
-    numerical_features = [
-        'hour', 'dayofweek', 'month',
-        'temperature', 'humidity', 'wind_speed',
-        'consumption_lag_1', 'consumption_lag_2', 'consumption_lag_3',
-        'consumption_lag_24', 'consumption_lag_48', 'consumption_lag_168',
-        'consumption_rolling_mean_3', 'consumption_rolling_mean_6',
-        'consumption_rolling_mean_12', 'consumption_rolling_mean_24',
-        'consumption_rolling_std_3', 'consumption_rolling_std_6',
-        'consumption_rolling_std_12', 'consumption_rolling_std_24'
-    ]
-    
-    categorical_features = [
-        'is_holiday', 'is_working_weekend', 'is_regular_weekend',
-        'is_working_day', 'is_weekend_or_holiday', 'is_weekend'
-    ]
-    
-    return numerical_features, categorical_features
-
 def prepare_features_for_prediction(df_historical, prediction_datetime, weather_data):
     """Подготовка признаков для одного предсказания"""
     
-    # Базовые временные признаки (целые числа для категориальных)
-    features = {
-        'hour': int(prediction_datetime.hour),
-        'dayofweek': int(prediction_datetime.weekday()),
-        'month': int(prediction_datetime.month),
-    }
+    # Создаем словарь признаков
+    features = {}
+    
+    # Базовые временные признаки (целые числа)
+    features['hour'] = prediction_datetime.hour
+    features['dayofweek'] = prediction_datetime.weekday()
+    features['month'] = prediction_datetime.month
     
     # Погодные данные (вещественные числа)
-    features.update({
-        'temperature': float(weather_data.get('temperature', 10.0)),
-        'humidity': float(weather_data.get('humidity', 70.0)),
-        'wind_speed': float(weather_data.get('wind_speed', 3.0)),
-    })
+    features['temperature'] = weather_data.get('temperature', 10.0)
+    features['humidity'] = weather_data.get('humidity', 70.0)
+    features['wind_speed'] = weather_data.get('wind_speed', 3.0)
     
     # Лаговые признаки
     for lag in [1, 2, 3, 24, 48, 168]:
@@ -74,39 +49,29 @@ def prepare_features_for_prediction(df_historical, prediction_datetime, weather_
         ].tail(window)
         
         if len(recent_data) >= min(3, window):
-            mean_val = float(recent_data['consumption'].mean())
-            std_val = float(recent_data['consumption'].std())
-            features[f'consumption_rolling_mean_{window}'] = mean_val
-            features[f'consumption_rolling_std_{window}'] = std_val
+            features[f'consumption_rolling_mean_{window}'] = float(recent_data['consumption'].mean())
+            features[f'consumption_rolling_std_{window}'] = float(recent_data['consumption'].std())
         else:
-            mean_val = float(df_historical['consumption'].mean())
-            std_val = float(df_historical['consumption'].std())
-            features[f'consumption_rolling_mean_{window}'] = mean_val
-            features[f'consumption_rolling_std_{window}'] = std_val
+            features[f'consumption_rolling_mean_{window}'] = float(df_historical['consumption'].mean())
+            features[f'consumption_rolling_std_{window}'] = float(df_historical['consumption'].std())
     
     # Календарные признаки (целые числа 0 или 1)
-    features.update({
-        'is_holiday': int(0),
-        'is_working_weekend': int(0),
-        'is_regular_weekend': int(prediction_datetime.weekday() in [5, 6]),
-        'is_working_day': int(prediction_datetime.weekday() not in [5, 6]),
-        'is_weekend_or_holiday': int(prediction_datetime.weekday() in [5, 6]),
-        'is_weekend': int(prediction_datetime.weekday() in [5, 6]),
-    })
+    is_weekend = 1 if prediction_datetime.weekday() in [5, 6] else 0
+    is_working_day = 1 if prediction_datetime.weekday() not in [5, 6] else 0
+    
+    features['is_holiday'] = 0
+    features['is_working_weekend'] = 0
+    features['is_regular_weekend'] = is_weekend
+    features['is_working_day'] = is_working_day
+    features['is_weekend_or_holiday'] = is_weekend
+    features['is_weekend'] = is_weekend
     
     return features
 
-def september_prediction_fixed():
-    """Исправленное предсказание для сентября 2025"""
+def september_prediction_clean():
+    """Очищенное предсказание для сентября 2025"""
     
-    print("=== ИСПРАВЛЕННОЕ ПРЕДСКАЗАНИЕ ДЛЯ СЕНТЯБРЯ 2025 ===")
-    
-    # Получаем информацию о признаках
-    numerical_features, categorical_features = get_model_feature_info()
-    all_features = numerical_features + categorical_features
-    
-    print(f"Числовые признаки: {len(numerical_features)}")
-    print(f"Категориальные признаки: {len(categorical_features)}")
+    print("=== ПРЕДСКАЗАНИЕ ДЛЯ СЕНТЯБРЯ 2025 ===")
     
     # Загрузка модели
     model = load_model()
@@ -156,7 +121,7 @@ def september_prediction_fixed():
         prediction_time = row['datetime']
         actual_consumption = row['consumption']
         
-        # Погодные данные из реальных исторических данных
+        # Погодные данные
         weather_data = {
             'temperature': row.get('temperature', 10.0),
             'humidity': row.get('humidity', 70.0),
@@ -166,11 +131,13 @@ def september_prediction_fixed():
         # Подготовка признаков
         features = prepare_features_for_prediction(extended_history, prediction_time, weather_data)
         
-        # Создание DataFrame с правильным порядком колонок
-        features_dict = {col: features.get(col, 0) for col in all_features}
-        features_df = pd.DataFrame([features_dict])
+        # Создание DataFrame
+        features_df = pd.DataFrame([features])
         
-        # Убеждаемся в правильных типах данных
+        # Приведение типов данных
+        categorical_features = ['hour', 'dayofweek', 'month', 'is_holiday', 'is_working_weekend', 
+                              'is_regular_weekend', 'is_working_day', 'is_weekend_or_holiday', 'is_weekend']
+        
         for col in features_df.columns:
             if col in categorical_features:
                 features_df[col] = features_df[col].astype(int)
@@ -186,17 +153,17 @@ def september_prediction_fixed():
             
             print(f"{prediction_time}: предсказано {prediction:.1f}, реально {actual_consumption:.1f}")
             
-            # Добавляем предсказание в историю для следующих шагов
+            # Добавляем предсказание в историю
             new_row = {
                 'datetime': prediction_time,
                 'consumption': float(prediction),
-                'hour': int(prediction_time.hour),
-                'dayofweek': int(prediction_time.weekday()),
-                'month': int(prediction_time.month),
-                'temperature': float(weather_data['temperature'])
+                'hour': prediction_time.hour,
+                'dayofweek': prediction_time.weekday(),
+                'month': prediction_time.month,
+                'temperature': weather_data['temperature']
             }
             
-            # Копируем другие доступные колонки
+            # Копируем другие колонки
             for col in extended_history.columns:
                 if col not in new_row and col in row and pd.notna(row[col]):
                     new_row[col] = row[col]
@@ -206,8 +173,6 @@ def september_prediction_fixed():
             
         except Exception as e:
             print(f"Ошибка при предсказании {prediction_time}: {e}")
-            print(f"Признаки: {list(features_df.columns)}")
-            print(f"Типы: {features_df.dtypes}")
             continue
     
     # Оценка качества
@@ -223,30 +188,6 @@ def september_prediction_fixed():
         print(f"MAPE: {mape:.2f}%")
         print(f"Среднее потребление: {np.mean(actual_values):.1f} МВт")
         
-        # Визуализация
-        if len(predictions) > 1:
-            plt.figure(figsize=(15, 8))
-            
-            plt.subplot(2, 1, 1)
-            plt.plot(prediction_times, actual_values, 'b-', label='Реальное', linewidth=2)
-            plt.plot(prediction_times, predictions, 'r--', label='Предсказанное', linewidth=2)
-            plt.title(f'Предсказания vs Реальные значения (MAE={mae:.3f})')
-            plt.ylabel('Потребление (МВт)')
-            plt.legend()
-            plt.grid(True, alpha=0.3)
-            
-            plt.subplot(2, 1, 2)
-            errors = np.abs(np.array(actual_values) - np.array(predictions))
-            plt.plot(prediction_times, errors, 'g-', alpha=0.7)
-            plt.title('Абсолютные ошибки')
-            plt.ylabel('Ошибка (МВт)')
-            plt.xlabel('Время')
-            plt.grid(True, alpha=0.3)
-            
-            plt.tight_layout()
-            plt.savefig('september_prediction_results.png', dpi=300, bbox_inches='tight')
-            plt.show()
-        
         # Сохранение результатов
         results_df = pd.DataFrame({
             'datetime': prediction_times,
@@ -261,4 +202,4 @@ def september_prediction_fixed():
         print("Не удалось выполнить ни одного предсказания!")
 
 if __name__ == "__main__":
-    september_prediction_fixed()
+    september_prediction_clean()
