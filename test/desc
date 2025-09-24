@@ -1,0 +1,56 @@
+После запуска этих двух файлов:
+
+В enhanced_filtered_training_data.csv появятся новые признаки:
+pressure, dew_point, visibility
+is_rain, is_fog, is_snow, is_thunderstorm, is_overcast
+
+# ... (все импорты без изменений)
+
+def train_model_with_optimization():
+    print("=== ОБУЧЕНИЕ УЛУЧШЕННОЙ МОДЕЛИ С РАСШИРЕННЫМИ ПОГОДНЫМИ ПРИЗНАКАМИ ===")
+    df = pd.read_csv(FILTERED_DATA_FILE)
+    df['datetime'] = pd.to_datetime(df['datetime'])
+    df = df.sort_values('datetime')
+    print(f"Всего данных: {len(df)}")
+    print(f"Период: {df['datetime'].min()} - {df['datetime'].max()}")
+
+    # === РАСШИРЕННЫЙ СПИСОК БАЗОВЫХ ПРИЗНАКОВ ===
+    base_features = [
+        'hour', 'hour_sin', 'hour_cos', 'dayofweek', 'month', 'week_of_year',
+        'temperature', 'humidity', 'wind_speed',
+        # Новые погодные признаки (если есть в датасете)
+        'pressure', 'pressure_sea_level', 'dew_point', 'visibility',
+        # Бинарные погодные явления
+        'is_rain', 'is_thunderstorm', 'is_fog', 'is_snow', 'is_overcast',
+        # Календарные флаги
+        'is_holiday', 'is_working_weekend', 'is_regular_weekend', 'is_working_day',
+        'is_weekend_or_holiday', 'is_weekend',
+        'is_winter', 'is_spring', 'is_summer', 'is_autumn'
+    ]
+
+    # Динамически добавляем лаги, скользящие и EWM
+    lag_cols = [col for col in df.columns if 'consumption_lag_' in col]
+    rolling_cols = [col for col in df.columns if 'consumption_rolling_' in col]
+    ewm_cols = [col for col in df.columns if 'consumption_ewm_' in col]
+
+    feature_columns = base_features + lag_cols + rolling_cols + ewm_cols
+
+    # Фильтруем только существующие колонки
+    feature_columns = [col for col in feature_columns if col in df.columns]
+
+    X = df[feature_columns]
+    y = df['consumption']
+
+    # Категориальные признаки — только бинарные и временные
+    categorical_features = [
+        'hour', 'dayofweek', 'month', 'week_of_year',
+        'is_holiday', 'is_working_weekend', 'is_regular_weekend', 'is_working_day',
+        'is_weekend_or_holiday', 'is_weekend',
+        'is_winter', 'is_spring', 'is_summer', 'is_autumn',
+        'is_rain', 'is_thunderstorm', 'is_fog', 'is_snow', 'is_overcast'
+    ]
+    categorical_features = [col for col in categorical_features if col in X.columns]
+
+    # ... (остальной код без изменений: tscv, GridSearchCV, обучение и т.д.)
+
+    
