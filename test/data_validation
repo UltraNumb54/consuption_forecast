@@ -1,0 +1,88 @@
+# data_validation.py
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+TRAIN_FILE = 'enhanced_filtered_training_data.csv'
+FULL_FILE = 'enhanced_filtered_full_data.csv'
+
+def validate_datasets():
+    print("=== ВАЛИДАЦИЯ ФИНАЛЬНЫХ ДАТАСЕТОВ ===")
+    
+    df_train = pd.read_csv(TRAIN_FILE)
+    df_full = pd.read_csv(FULL_FILE)
+    
+    print(f"Обучающий датасет: {len(df_train)} строк, {len(df_train.columns)} колонок")
+    print(f"Полный датасет: {len(df_full)} строк, {len(df_full.columns)} колонок")
+    
+    # Проверка пропусков
+    print("\n=== ПРОПУСКИ В ОБУЧАЮЩЕМ ДАТАСЕТЕ ===")
+    missing_train = df_train.isnull().sum()
+    missing_train = missing_train[missing_train > 0]
+    if len(missing_train) == 0:
+        print("✅ Нет пропусков!")
+    else:
+        for col, cnt in missing_train.items():
+            print(f"  {col}: {cnt} ({cnt/len(df_train)*100:.2f}%)")
+    
+    print("\n=== ПРОПУСКИ В ПОЛНОМ ДАТАСЕТЕ ===")
+    missing_full = df_full.isnull().sum()
+    missing_full = missing_full[missing_full > 0]
+    if len(missing_full) == 0:
+        print("✅ Нет пропусков!")
+    else:
+        for col, cnt in missing_full.items():
+            print(f"  {col}: {cnt} ({cnt/len(df_full)*100:.2f}%)")
+    
+    # Проверка новых погодных признаков
+    new_weather_cols = ['pressure', 'dew_point', 'visibility', 'is_rain', 'is_fog', 'is_snow', 'is_overcast']
+    print("\n=== СТАТИСТИКА ПО НОВЫМ ПОГОДНЫМ ПРИЗНАКАМ ===")
+    for col in new_weather_cols:
+        if col in df_train.columns:
+            non_null = df_train[col].notna().sum()
+            total = len(df_train)
+            print(f"  {col}: {non_null}/{total} ({non_null/total*100:.1f}%) заполнено")
+            if df_train[col].dtype in ['float64', 'int64']:
+                print(f"      min={df_train[col].min():.2f}, max={df_train[col].max():.2f}, mean={df_train[col].mean():.2f}")
+        else:
+            print(f"  {col}: ❌ отсутствует в датасете")
+    
+    # Визуализация: распределение новых признаков
+    plt.figure(figsize=(15, 10))
+    plot_cols = [col for col in ['pressure', 'dew_point', 'visibility'] if col in df_train.columns]
+    for i, col in enumerate(plot_cols, 1):
+        plt.subplot(2, 2, i)
+        df_train[col].hist(bins=50, alpha=0.7)
+        plt.title(f'Распределение {col}')
+        plt.grid(False)
+    
+    # Корреляция с потреблением
+    if 'consumption' in df_train.columns:
+        corr_cols = plot_cols + ['temperature', 'humidity']
+        corr_data = df_train[['consumption'] + [c for c in corr_cols if c in df_train.columns]]
+        corr_matrix = corr_data.corr()
+        
+        plt.subplot(2, 2, len(plot_cols) + 1)
+        sns.heatmap(corr_matrix[['consumption']].drop('consumption'), annot=True, cmap='coolwarm', center=0)
+        plt.title('Корреляция с consumption')
+    
+    plt.tight_layout()
+    plt.savefig('data_validation_report.png', dpi=300, bbox_inches='tight')
+    print("\n📊 Валидационный отчёт сохранён в data_validation_report.png")
+    
+    # Сохраняем отчёт в CSV
+    report = pd.DataFrame({
+        'column': df_train.columns,
+        'dtype': df_train.dtypes,
+        'non_null_count': df_train.notnull().sum(),
+        'null_pct': (df_train.isnull().sum() / len(df_train) * 100).round(2),
+        'mean': df_train.select_dtypes(include=[np.number]).mean(),
+        'std': df_train.select_dtypes(include=[np.number]).std()
+    }).set_index('column')
+    
+    report.to_csv('data_validation_summary.csv')
+    print("📄 Текстовый отчёт сохранён в data_validation_summary.csv")
+
+if __name__ == "__main__":
+    validate_datasets()
