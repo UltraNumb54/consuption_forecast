@@ -1,0 +1,294 @@
+# api_app/app.py
+
+from flask import Flask, request, render_template, redirect, url_for, flash, jsonify
+import os
+import logging
+import sys
+import pandas as pd
+from datetime import datetime, timedelta
+# Импортируем функции из твоих существующих скриптов
+# Пути нужно скорректировать в зависимости от структуры
+# Предположим, что api_app лежит рядом с src/
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from src.data_ingestion import load_consumption_data, load_weather_data, load_calendar_data
+from src.preprocess import main_preprocess
+from src.model_training import train_model, compare_and_save_model
+from src.model_serving import load_model, predict
+
+# --- Настройки Flask ---
+app = Flask(__name__)
+app.secret_key = 'your_secret_key_here' # Замените на случайный ключ!
+app.config['UPLOAD_FOLDER'] = os.path.join(os.path.dirname(__file__), 'uploads')
+app.config['MAX_CONTENT_PATH'] = 16 * 1024 * 1024  # 16MB max-limit.
+# Убедитесь, что папка uploads существует
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+
+# --- Настройки модели и данных ---
+MODELS_DIR = os.path.join(os.path.dirname(__file__), '..', 'models')
+PROCESSED_DATA_DIR = os.path.join(os.path.dirname(__file__), '..', 'data', 'processed')
+RAW_DATA_DIR = os.path.join(os.path.dirname(__file__), '..', 'data', 'raw')
+
+# --- Вспомогательные функции ---
+def get_latest_model_info():
+    """Получает информацию о последней модели (например, дату сохранения)."""
+    model_path = os.path.join(MODELS_DIR, "latest_model.cbm")
+    if os.path.exists(model_path):
+        mod_time = os.path.getmtime(model_path)
+        return datetime.fromtimestamp(mod_time).strftime('%Y-%m-%d %H:%M:%S')
+    return "Модель не найдена"
+
+def get_feature_columns_from_model():
+    """Загружает модель и возвращает список её признаков."""
+    try:
+        model = load_model() # Используем вашу функцию
+        return model.feature_names_
+    except Exception as e:
+        logging.error(f"Ошибка при получении признаков модели: {e}")
+        return None
+
+# --- Маршруты (Routes) Flask ---
+
+@app.route('/')
+def index():
+    """Главная страница."""
+    model_info = get_latest_model_info()
+    return render_template('index.html', model_info=model_info)
+
+@app.route('/upload', methods=['GET', 'POST'])
+def upload_files():
+    """Страница загрузки файлов."""
+    if request.method == 'POST':
+        # Получаем файлы из формы
+        consumption_file = request.files.get('consumption_file')
+        weather_file = request.files.get('weather_file')
+        calendar_file = request.files.get('calendar_file')
+
+        errors = []
+        success_files = []
+
+        if consumption_file and consumption_file.filename != '':
+            try:
+                filename = consumption_file.filename
+                filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+                consumption_file.save(filepath)
+                # Проверим, можно ли загрузить как CSV
+                df = pd.read_csv(filepath, sep=';', nrows=1) # Проверка
+                success_files.append(filename)
+            except Exception as e:
+                errors.append(f"Ошибка загрузки consumption файла: {e}")
+        else:
+            errors.append("Файл consumption_data.csv не загружен.")
+
+        if weather_file and weather_file.filename != '':
+            try:
+                filename = weather_file.filename
+                filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+                weather_file.save(filepath)
+                # Проверим, можно ли загрузить как CSV
+                with open(filepath, 'r', encoding='utf-8') as f:
+                    lines = f.readlines()
+                header_found = any(line.strip().startswith('"Местное время') for line in lines[:10])
+                if not header_found:
+                    raise ValueError("Не найден заголовок погоды.")
+                success_files.append(filename)
+            except Exception as e:
+                errors.append(f"Ошибка загрузки weather файла: {e}")
+        else:
+            errors.append("Файл weather_data.csv не загружен.")
+
+        if calendar_file and calendar_file.filename != '':
+            try:
+                filename = calendar_file.filename
+                filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+                calendar_file.save(filepath)
+                # Проверим, можно ли загрузить как CSV
+                df = pd.read_csv(filepath, nrows=1) # Проверка
+                success_files.append(filename)
+            except Exception as e:
+                errors.append(f"Ошибка загрузки calendar файла: {e}")
+        else:
+            errors.append("Файл russian_production_calendar.csv не загружен.")
+
+        if errors:
+            for error in errors:
+                flash(error, 'error')
+        else:
+            for filename in success_files:
+                flash(f'Файл {filename} успешно загружен!', 'success')
+            # Опционально: переместить файлы в data/raw/
+            for filename in success_files:
+                src_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+                dest_path = os.path.join(RAW_DATA_DIR, os.path.basename(filename))
+                os.makedirs(RAW_DATA_DIR, exist_ok=True)
+                os.replace(src_path, dest_path) # Перемещает файл
+                flash(f'Файл {filename} перемещён в {RAW_DATA_DIR}.', 'info')
+            return redirect(url_for('upload_files'))
+
+    return render_template('upload.html')
+
+@app.route('/train', methods=['GET', 'POST'])
+def train_model_endpoint():
+    """Страница переобучения модели."""
+    if request.method == 'POST':
+        try:
+            # Загрузка данных (из data/raw/ как в pipeline_runner.py)
+            logging.info("Загрузка данных для переобучения...")
+            df_con = load_consumption_data() # Измените пути, если нужно
+            df_w = load_weather_data()
+            df_cal = load_calendar_data()
+            logging.info("Данные загружены.")
+
+            # Предобработка
+            logging.info("Предобработка данных...")
+            df_processed = main_preprocess(df_con, df_w, df_cal)
+            logging.info("Предобработка завершена.")
+
+            # Подготовка данных для обучения
+            feature_columns = [col for col in df_processed.columns if col not in ['consumption', 'datetime']]
+            df_for_training = df_processed[df_processed['datetime'] < df_processed['datetime'].max() - timedelta(days=1)]
+
+            if len(df_for_training) == 0:
+                 raise ValueError("Недостаточно данных для обучения после фильтрации.")
+
+            # Обучение
+            logging.info("Обучение модели...")
+            model = train_model(df_for_training, feature_columns)
+            mape_val = model.get_best_score()['validation_0']['MAPE'] # Или другая метрика
+            logging.info(f"Обучение завершено. MAPE: {mape_val:.4f}")
+
+            # Сравнение и сохранение
+            logging.info("Сравнение и сохранение модели...")
+            model_updated = compare_and_save_model(model, mape_val, feature_columns)
+            logging.info("Сравнение завершено.")
+
+            if model_updated:
+                flash(f'Модель успешно переобучена и сохранена. MAPE: {mape_val:.4f}', 'success')
+            else:
+                flash(f'Новая модель обучена, но не лучше текущей. MAPE: {mape_val:.4f}', 'info')
+
+        except Exception as e:
+            logging.error(f"Ошибка при переобучении: {e}")
+            flash(f'Ошибка при переобучении: {e}', 'error')
+
+        return redirect(url_for('train_model_endpoint'))
+
+    model_info = get_latest_model_info()
+    return render_template('train.html', model_info=model_info)
+
+@app.route('/predict', methods=['GET', 'POST'])
+def predict_endpoint():
+    """Страница получения прогноза."""
+    if request.method == 'POST':
+        try:
+            # Пользователь может указать дату начала и количество дней для прогноза
+            start_date_str = request.form.get('start_date', datetime.now().strftime('%Y-%m-%d'))
+            forecast_days = int(request.form.get('forecast_days', 3))
+            if forecast_days < 1 or forecast_days > 7: # Ограничим диапазон
+                raise ValueError("Количество дней прогноза должно быть от 1 до 7.")
+
+            start_date = datetime.strptime(start_date_str, '%Y-%m-%d')
+            end_date = start_date + timedelta(days=forecast_days)
+
+            # Загрузка модели
+            logging.info("Загрузка модели для прогноза...")
+            model = load_model() # Используем вашу функцию
+            feature_cols_from_model = model.feature_names_
+            logging.info("Модель загружена.")
+
+            # --- КРИТИЧЕСКИЙ МОМЕНТ: Получение признаков для прогноза ---
+            # Для *настоящего* прогноза на будущее, нужны *все* признаки для будущих дат.
+            # Это невозможно без *внешнего* прогноза погоды, календаря и предыдущих значений потребления.
+            # В текущем пайплайне, признаки (особенно лаги) формируются *на основе истории*.
+            # Поэтому, настоящий прогноз на будущее требует:
+            # 1. Интеграцию с API погодного прогноза.
+            # 2. Генерацию признаков "шаг за шагом" (рекурсивно), используя предыдущие прогнозы как лаги.
+            # Это *очень сложная* задача.
+
+            # ПРАКТИЧЕСКИЙ ПОДХОД:
+            # 1. Использовать *обучающий* датасет (или его конец) как источник "истории".
+            # 2. Выбрать участок *после* которого можно сформировать признаки для прогноза.
+            # 3. Сформировать признаки для этого участка (как в test).
+            # 4. Сделать прогноз.
+            # Это *не* прогноз на *настоящее* будущее, а проверка на уже существующих данных.
+            # Для *демонстрации* API это может быть приемлемо.
+
+            # АЛЬТЕРНАТИВА: Сделать прогноз на основе последних *известных* данных в датасете.
+            # Это также не "настоящее" будущее, но ближе к реальности.
+
+            # ЗАГРУЗКА ПОСЛЕДНЕГО ОБРАБОТАННОГО ДАТАСЕТА (например, из pipeline)
+            # Предположим, у вас есть файл PROCESSED_FILE_PATH из pipeline_runner.py
+            PROCESSED_FILE_PATH = os.path.join(PROCESSED_DATA_DIR, "final_processed_data.csv")
+            if not os.path.exists(PROCESSED_FILE_PATH):
+                raise FileNotFoundError(f"Файл обработанных данных {PROCESSED_FILE_PATH} не найден. Запустите пайплайн.")
+
+            logging.info(f"Загрузка обработанных данных из {PROCESSED_FILE_PATH}...")
+            df_full_processed = pd.read_csv(PROCESSED_FILE_PATH)
+            df_full_processed['datetime'] = pd.to_datetime(df_full_processed['datetime'])
+            df_full_processed = df_full_processed.sort_values('datetime').reset_index(drop=True)
+
+            # Найдём участок, который можно использовать для прогноза
+            # Нужно как минимум max_lag строк до "прогноза", чтобы сформировать лаги
+            max_lag = 168 # из create_lag_features
+            # Выбираем последние N часов из датасета, где N >= max_lag + forecast_horizon
+            forecast_horizon_hours = forecast_days * 24
+            required_rows = max_lag + forecast_horizon_hours
+
+            if len(df_full_processed) < required_rows:
+                 raise ValueError(f"Недостаточно данных в датасете для прогноза на {forecast_days} дней. Требуется {required_rows}, доступно {len(df_full_processed)}.")
+
+            # Берём последние строки, на которых можно сформировать признаки
+            df_pred_features_source = df_full_processed.iloc[-required_rows:].copy()
+
+            # Проверяем, что все признаки модели присутствуют
+            missing_cols = [col for col in feature_cols_from_model if col not in df_pred_features_source.columns]
+            if missing_cols:
+                raise ValueError(f"Отсутствуют колонки признаков в обработанном датасете: {missing_cols}")
+
+            # Выбираем признаки для прогноза (последние forecast_horizon_hours строк)
+            X_pred = df_pred_features_source.tail(forecast_horizon_hours)[feature_cols_from_model]
+
+            if X_pred.shape[0] != forecast_horizon_hours:
+                 raise ValueError(f"Не удалось сформировать {forecast_horizon_hours} признаков для прогноза.")
+
+            logging.info("Признаки для прогноза подготовлены.")
+            logging.info(f"Прогноз на {forecast_horizon_hours} часов с {df_pred_features_source.tail(forecast_horizon_hours)['datetime'].iloc[0]} по {df_pred_features_source.tail(forecast_horizon_hours)['datetime'].iloc[-1]}")
+
+            # Прогноз
+            logging.info("Генерация прогноза...")
+            predictions = predict(model, X_pred) # Используем вашу функцию
+            logging.info("Прогноз завершён.")
+
+            # Подготовка результата
+            # Временные метки - это даты из df_pred_features_source
+            prediction_times = df_pred_features_source.tail(forecast_horizon_hours)['datetime'].tolist()
+
+            # Возвращаем JSON с результатами
+            results = []
+            for dt, pred in zip(prediction_times, predictions):
+                 results.append({
+                     'datetime': dt.isoformat(),
+                     'predicted_consumption': float(pred)
+                 })
+
+            # flash(f'Прогноз на {forecast_days} дней с {start_date_str} успешно сгенерирован.', 'success')
+            # return render_template('predict.html', results=results, forecast_days=forecast_days, start_date=start_date_str)
+            return jsonify({'status': 'success', 'predictions': results, 'forecast_days': forecast_days, 'start_date': start_date_str})
+
+        except Exception as e:
+            logging.error(f"Ошибка при генерации прогноза: {e}")
+            # flash(f'Ошибка при генерации прогноза: {e}', 'error')
+            # return redirect(url_for('predict_endpoint'))
+            return jsonify({'status': 'error', 'message': str(e)}), 500
+
+    model_info = get_latest_model_info()
+    return render_template('predict.html', model_info=model_info)
+
+
+# --- Запуск приложения ---
+if __name__ == '__main__':
+    # Настройка логирования
+    logging.basicConfig(level=logging.INFO)
+    # Запуск Flask сервера
+    # debug=True позволяет видеть ошибки в браузере и перезапускать сервер при изменении кода
+    # host='0.0.0.0' позволяет подключаться к серверу с других устройств в сети (опционально)
+    app.run(debug=True, host='127.0.0.1', port=5000)
