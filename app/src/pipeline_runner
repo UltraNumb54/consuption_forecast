@@ -1,0 +1,132 @@
+# pipeline_runner.py
+
+import os
+import sys
+import logging
+from datetime import datetime, timedelta
+
+# Добавляем путь к src
+sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
+
+from src.data_ingestion import load_consumption_data, load_weather_data, load_calendar_data
+from src.preprocess import main_preprocess
+from src.model_training import train_model, compare_and_save_model
+from src.model_serving import load_model, predict
+
+# Пути
+PROCESSED_DATA_DIR = "data/processed"
+PREDICTIONS_DIR = "data/predictions"
+LOGS_DIR = "logs"
+
+# Имя файла для финального обработанного датасета
+PROCESSED_FILE_NAME = "final_processed_data.csv"
+PROCESSED_FILE_PATH = os.path.join(PROCESSED_DATA_DIR, PROCESSED_FILE_NAME)
+
+# Имя файла для прогноза
+PREDICTION_FILE_NAME = f"prediction_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+PREDICTION_FILE_PATH = os.path.join(PREDICTIONS_DIR, PREDICTION_FILE_NAME)
+
+def setup_logging():
+    """Настройка логирования."""
+    os.makedirs(LOGS_DIR, exist_ok=True)
+    log_file = os.path.join(LOGS_DIR, f"pipeline_{datetime.now().strftime('%Y%m%d')}.log")
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_file),
+            logging.StreamHandler() # Вывод в консоль
+        ]
+    )
+    logging.info("=== НАЧАЛО ВЫПОЛНЕНИЯ ПАЙПЛАЙНА ===")
+
+def main():
+    setup_logging()
+    try:
+        # Шаг 1: Загрузка данных
+        logging.info("Шаг 1: Загрузка данных.")
+        df_con = load_consumption_data()
+        df_w = load_weather_data()
+        df_cal = load_calendar_data()
+
+        # Шаг 2: Предобработка
+        logging.info("Шаг 2: Предобработка данных.")
+        df_processed = main_preprocess(df_con, df_w, df_cal)
+        os.makedirs(PROCESSED_DATA_DIR, exist_ok=True)
+        df_processed.to_csv(PROCESSED_FILE_PATH, index=False)
+        logging.info(f"Обработанный датасет сохранён в {PROCESSED_FILE_PATH}")
+
+        # Шаг 3: Обучение модели
+        logging.info("Шаг 3: Обучение модели.")
+        # Выбираем признаки (все, кроме целевой переменной 'consumption' и 'datetime')
+        feature_columns = [col for col in df_processed.columns if col not in ['consumption', 'datetime']]
+        # Опционально: фильтрация датасета для обучения (например, без последнего месяца)
+        # df_for_training = df_processed[df_processed['datetime'] < pd.Timestamp('2025-09-01')]
+        # В реальности, здесь может быть логика выбора данных для обучения
+        # на основе даты последнего обновления или планировщика.
+        # Для примера, используем весь df_processed, но можно добавить фильтрацию.
+        # Также важно, чтобы обучение происходило на данных, не включающих "будущее" относительно прогноза.
+        df_for_training = df_processed[df_processed['datetime'] < df_processed['datetime'].max() - timedelta(days=1)] # Пример: не использовать последний день для обучения
+        model = train_model(df_for_training, feature_columns)
+        # Оценка новой модели (например, MAPE на валидации)
+        # Предположим, что train_model возвращает или логирует MAPE_val
+        # Извлекаем MAPE_val из логов или передаём из функции train_model
+        # Для простоты, возьмём его из модели, если она его хранит (например, через get_best_score)
+        # Или передаём из train_model как возвращаемое значение.
+        # Изменяем train_model, чтобы она возвращала mape_val
+        # mape_val = train_model(...)
+        # Или получаем из обученной модели, если она доступна после fit
+        mape_val = model.get_best_score()['validation_0']['MAPE'] # Или другая метрика
+        logging.info(f"MAPE новой модели на валидации: {mape_val:.4f}")
+
+        # Шаг 4: Сравнение и сохранение лучшей модели
+        logging.info("Шаг 4: Сравнение и сохранение модели.")
+        model_updated = compare_and_save_model(model, mape_val, feature_columns)
+
+        # Шаг 5: Генерация прогноза (если модель обновлена или всегда)
+        logging.info("Шаг 5: Генерация прогноза.")
+        # Выбираем последние N часов для генерации признаков для прогноза
+        # В реальности, это может быть "последние N часов + прогноз погоды на 3 дня вперёд"
+        # Но в данном случае, у нас нет "новой" погоды, только архив.
+        # Поэтому, мы можем сгенерировать прогноз на основе последних доступных данных в df_processed
+        # и предположить, что погода на следующие 3 дня будет такой же, как последние дни,
+        # или использовать внешний прогноз погоды, если он доступен.
+        # Для простоты, делаем прогноз на следующие 72 часа (3 дня) на основе последних данных.
+        # Берём последние строки, на которых можно сформировать признаки (например, лаги)
+        # Требуется как минимум max_lag + 1 строка для формирования признаков для одной точки
+        max_lag = 168 # из create_lag_features
+        if len(df_processed) >= max_lag + 72: # 72 часа = 3 дня
+            df_last_features = df_processed.iloc[-(max_lag + 72):].copy()
+            # Для прогноза на "будущее", нужно обновить признаки (часы, дни недели, календарь, погоду)
+            # Это невозможно без внешних данных.
+            # В реальности, df_last_features должен быть подготовлен с учётом "будущего" времени,
+            # включая внешний прогноз погоды и календарь.
+            # Пайплайн в текущем виде может только оценить модель на существующих данных.
+            # Для реального прогноза, нужен отдельный шаг генерации признаков на основе внешних прогнозов.
+            # Пока что, сделаем прогноз на последние 72 часа в датасете.
+            df_pred_features = df_last_features[feature_columns]
+            # Загружаем *лучшую* модель
+            best_model = load_model()
+            predictions = predict(best_model, df_pred_features)
+            # Сохраняем прогноз
+            os.makedirs(PREDICTIONS_DIR, exist_ok=True)
+            results_df = pd.DataFrame({
+                'datetime': df_last_features['datetime'].values, # Время, на которое сделан прогноз
+                'predicted_consumption': predictions,
+                'actual_consumption': df_last_features['consumption'].values # Если есть, для оценки
+            })
+            results_df.to_csv(PREDICTION_FILE_PATH, index=False)
+            logging.info(f"Прогнозы сохранены в {PREDICTION_FILE_PATH}")
+        else:
+            logging.warning("Недостаточно данных для генерации прогноза на 72 часа.")
+
+
+        logging.info("=== ВЫПОЛНЕНИЕ ПАЙПЛАЙНА ЗАВЕРШЕНО УСПЕШНО ===")
+
+    except Exception as e:
+        logging.error(f"Ошибка при выполнении пайплайна: {e}")
+        logging.exception("Полный трейсбек ошибки:")
+        raise # Переподнимаем ошибку для cron или другого планировщика
+
+if __name__ == "__main__":
+    main()
