@@ -1,0 +1,55 @@
+# src/model_serving.py
+
+import pandas as pd
+from catboost import CatBoostRegressor
+import os
+import logging
+
+# Пути к модели
+MODELS_DIR = "../models"
+MODEL_PATH = os.path.join(MODELS_DIR, "latest_model.cbm")
+
+def load_model():
+    """
+    Загружает последнюю лучшую модель.
+    """
+    logging.info(f"Загрузка модели из {MODEL_PATH}")
+    try:
+        model = CatBoostRegressor()
+        model.load_model(MODEL_PATH)
+        logging.info("Модель успешно загружена.")
+        return model
+    except FileNotFoundError:
+        logging.error(f"Файл модели {MODEL_PATH} не найден.")
+        raise
+    except Exception as e:
+        logging.error(f"Ошибка при загрузке модели: {e}")
+        raise
+
+def predict(model, df_features):
+    """
+    Делает прогноз на основе загруженной модели и признаков.
+    df_features: DataFrame с признаками, как при обучении.
+    """
+    logging.info("Начало генерации прогнозов.")
+    feature_columns = model.feature_names_
+    logging.info(f"Модель ожидает {len(feature_columns)} признаков.")
+
+    # Проверяем, что все признаки присутствуют
+    missing_cols = [col for col in feature_columns if col not in df_features.columns]
+    if missing_cols:
+        logging.error(f"В датасете отсутствуют колонки признаков: {missing_cols}")
+        raise ValueError(f"Отсутствуют колонки признаков: {missing_cols}")
+
+    X_pred = df_features[feature_columns]
+    predictions = model.predict(X_pred)
+    logging.info("Прогнозы сгенерированы.")
+    return predictions
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    # Тестовый запуск
+    # model = load_model()
+    # # Предположим, у нас есть df_with_features
+    # # predictions = predict(model, df_with_features)
+    # # print(predictions)
