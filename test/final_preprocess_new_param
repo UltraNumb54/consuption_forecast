@@ -1,0 +1,130 @@
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+
+# === КОНСТАНТЫ ===
+PROCESSED_DATA_FILE = 'enhanced_processed_energy_data.csv'
+FILTERED_TRAINING_FILE = 'enhanced_filtered_training_data.csv'
+FILTERED_FULL_FILE = 'enhanced_filtered_full_data.csv'
+
+
+def load_and_filter_quality_data(include_september=False):
+    print("=== ФИЛЬТРАЦИЯ ДАННЫХ ПО КАЧЕСТВУ ===")
+    df = pd.read_csv(PROCESSED_DATA_FILE)
+    df['datetime'] = pd.to_datetime(df['datetime'])
+    print(f"Исходные данные: {len(df)} записей")
+
+    df['year'] = df['datetime'].dt.year
+    df['month'] = df['datetime'].dt.month
+
+    problematic_years = [2017]
+    df_filtered = df[~df['year'].isin(problematic_years)]
+    print(f"После фильтрации проблемных лет: {len(df_filtered)} записей")
+
+    if not include_september:
+        df_filtered = df_filtered[
+            ~((df_filtered['year'] == 2025) & (df_filtered['month'] == 9))
+        ]
+        print(f"После исключения сентября 2025: {len(df_filtered)} записей")
+
+    # === РАСШИРЕННАЯ ПРОВЕРКА ПОЛНОТЫ: включаем новые погодные признаки ===
+    df_filtered['year_month'] = df_filtered['datetime'].dt.to_period('M')
+    weather_cols = ['temperature', 'humidity', 'wind_speed', 'pressure', 'dew_point', 'visibility']
+    # Удаляем колонки, которых нет
+    weather_cols = [col for col in weather_cols if col in df_filtered.columns]
+
+    monthly_stats = df_filtered.groupby('year_month').agg({
+        'consumption': 'count',
+        **{col: lambda x: x.notna().sum() for col in weather_cols}
+    }).rename(columns={'consumption': 'total_records'})
+
+    for col in weather_cols:
+        monthly_stats[f'{col}_completeness'] = monthly_stats[col] / monthly_stats['total_records']
+
+    # Все погодные признаки должны быть >80% заполнены
+    completeness_cols = [f'{col}_completeness' for col in weather_cols]
+    good_months = monthly_stats[
+        (monthly_stats[completeness_cols] > 0.8).all(axis=1)
+    ].index
+
+    df_filtered = df_filtered[df_filtered['year_month'].isin(good_months)]
+    print(f"После фильтрации по полноте: {len(df_filtered)} записей")
+    return df_filtered
+
+
+def handle_missing_values(df):
+    print("=== ОБРАБОТКА ПРОПУСКОВ ===")
+    missing_stats = df.isnull().sum()
+    for col, count in missing_stats[missing_stats > 0].items():
+        print(f"  {col}: {count} ({count/len(df)*100:.2f}%)")
+
+    # Все погодные и временные признаки
+    weather_cols = ['temperature', 'humidity', 'wind_speed', 'pressure', 'pressure_sea_level', 'dew_point', 'visibility']
+    lag_cols = [col for col in df.columns if 'consumption_lag_' in col]
+    rolling_cols = [col for col in df.columns if 'consumption_rolling_' in col]
+    ewm_cols = [col for col in df.columns if 'consumption_ewm_' in col]
+    binary_weather = ['is_rain', 'is_thunderstorm', 'is_fog', 'is_snow', 'is_overcast']
+
+    all_cols = [col for col in (weather_cols + lag_cols + rolling_cols + ewm_cols) if col in df.columns]
+
+    # Интерполяция погодных данных по дням
+    for col in weather_cols:
+        if col in df.columns:
+            df[col] = df.groupby(df['datetime'].dt.date)[col].transform(
+                lambda x: x.interpolate(method='linear', limit=3, limit_direction='both')
+            )
+            hourly_mean = df.groupby('hour')[col].transform('mean')
+            df[col] = df[col].fillna(hourly_mean)
+
+    # Лаги и скользящие — линейная интерполяция
+    for col in lag_cols + rolling_cols + ewm_cols:
+        if col in df.columns:
+            df[col] = df[col].interpolate(method='linear', limit_direction='both')
+
+    # Финальное заполнение медианой
+    for col in all_cols:
+        if col in df.columns:
+            df[col] = df[col].fillna(df[col].median())
+
+    # Бинарные признаки — заполняем 0 (отсутствие явления)
+    for col in binary_weather:
+        if col in df.columns:
+            df[col] = df[col].fillna(0).astype(int)
+
+    print("Пропуски после обработки:")
+    missing_stats = df.isnull().sum()
+    for col, count in missing_stats[missing_stats > 0].items():
+        print(f"  {col}: {count} ({count/len(df)*100:.2f}%)")
+    return df
+
+
+def create_final_dataset():
+    print("=== СОЗДАНИЕ ФИНАЛЬНЫХ ДАТАСЕТОВ ===")
+    df_full = load_and_filter_quality_data(include_september=True)
+    df_full = handle_missing_values(df_full)
+
+    critical_cols = ['consumption', 'temperature', 'humidity', 'wind_speed']
+    df_full = df_full.dropna(subset=[col for col in critical_cols if col in df_full.columns])
+    print(f"Полный отфильтрованный датасет: {len(df_full)} записей")
+
+    df_for_training = df_full[~((df_full['year'] == 2025) & (df_full['month'] == 9))]
+    print(f"Датасет для обучения (без сентября 2025): {len(df_for_training)} записей")
+
+    df_for_training.to_csv(FILTERED_TRAINING_FILE, index=False)
+    df_full.to_csv(FILTERED_FULL_FILE, index=False)
+
+    print(f"Датасет для обучения сохранен в {FILTERED_TRAINING_FILE}")
+    print(f"Полный датасет (для теста) сохранен в {FILTERED_FULL_FILE}")
+
+    print(f"\nСтатистика по датасету для обучения:")
+    print(f"   Период: {df_for_training['datetime'].min()} - {df_for_training['datetime'].max()}")
+    print(f"   Используемые годы: {sorted(df_for_training['year'].unique().tolist())}")
+
+    print(f"\nСтатистика по полному датасету:")
+    print(f"   Период: {df_full['datetime'].min()} - {df_full['datetime'].max()}")
+    return df_for_training, df_full
+
+
+if __name__ == "__main__":
+    df_train, df_full = create_final_dataset()
+    print("\nФинальная предобработка завершена успешно!")
