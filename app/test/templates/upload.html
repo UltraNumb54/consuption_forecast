@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+
+{% block content %}
+    <h1>Загрузка Данных</h1>
+    <p>Загрузите три файла: потребление, погода, календарь.</p>
+    <form method="post" enctype="multipart/form-data">
+        <div class="form-group">
+            <label for="consumption_file">Файл потребления (consumption_data.csv):</label>
+            <input type="file" id="consumption_file" name="consumption_file" required>
+        </div>
+        <div class="form-group">
+            <label for="weather_file">Файл погоды (weather_data.csv):</label>
+            <input type="file" id="weather_file" name="weather_file" required>
+        </div>
+        <div class="form-group">
+            <label for="calendar_file">Файл календаря (russian_production_calendar_2017_2025.csv):</label>
+            <input type="file" id="calendar_file" name="calendar_file" required>
+        </div>
+        <button type="submit" class="btn">Загрузить</button>
+    </form>
+{% endblock %}
