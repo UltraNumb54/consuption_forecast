@@ -1,0 +1,227 @@
+# rolling_retrain_test.py
+import pandas as pd
+import numpy as np
+from catboost import CatBoostRegressor
+import matplotlib.pyplot as plt
+from sklearn.metrics import mean_absolute_error, mean_absolute_percentage_error
+from datetime import datetime, timedelta
+import os
+import warnings
+warnings.filterwarnings('ignore')
+
+# === КОНСТАНТЫ ===
+FULL_DATA_FILE = 'enhanced_filtered_full_data.csv'
+OUTPUT_DIR = './rolling_retrain_results/'
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+def get_feature_columns():
+    """Возвращает список признаков (аналогично обучению)"""
+    base_features = [
+        'hour', 'hour_sin', 'hour_cos', 'dayofweek', 'month', 'week_of_year',
+        'temperature', 'humidity', 'wind_speed',
+        'is_holiday', 'is_working_weekend', 'is_regular_weekend', 'is_working_day',
+        'is_weekend_or_holiday', 'is_weekend',
+        'is_winter', 'is_spring', 'is_summer', 'is_autumn'
+    ]
+    # Лаги и скользящие окна будут добавлены динамически
+    return base_features
+
+def create_features(df):
+    """Создаёт все признаки (как в preproccesing.py)"""
+    df = df.copy()
+    # Базовые признаки
+    df['hour'] = df['datetime'].dt.hour
+    df['hour_sin'] = np.sin(2 * np.pi * df['hour'] / 24)
+    df['hour_cos'] = np.cos(2 * np.pi * df['hour'] / 24)
+    df['dayofweek'] = df['datetime'].dt.dayofweek
+    df['month'] = df['datetime'].dt.month
+    df['week_of_year'] = df['datetime'].dt.isocalendar().week
+    
+    season = df['month'] % 12 // 3 + 1
+    df['is_winter'] = (season == 1).astype(int)
+    df['is_spring'] = (season == 2).astype(int)
+    df['is_summer'] = (season == 3).astype(int)
+    df['is_autumn'] = (season == 4).astype(int)
+    df['is_weekend'] = df['dayofweek'].isin([5, 6]).astype(int)
+    
+    # Лаги
+    lag_hours = [1, 2, 3, 24, 48, 72, 120, 168]
+    for lag in lag_hours:
+        df[f'consumption_lag_{lag}'] = df['consumption'].shift(lag)
+    
+    # Скользящие
+    windows = [3, 6, 12, 24, 720]
+    for w in windows:
+        df[f'consumption_rolling_mean_{w}'] = df['consumption'].rolling(w).mean()
+        df[f'consumption_rolling_std_{w}'] = df['consumption'].rolling(w).std()
+    
+    # EWM
+    spans = [3, 6, 12, 24]
+    for s in spans:
+        df[f'consumption_ewm_mean_{s}'] = df['consumption'].ewm(span=s).mean()
+    
+    return df
+
+def train_model_on_data(df_train):
+    """Обучает модель на переданном датасете"""
+    base_features = get_feature_columns()
+    lag_cols = [col for col in df_train.columns if 'consumption_lag_' in col]
+    rolling_cols = [col for col in df_train.columns if 'consumption_rolling_' in col]
+    ewm_cols = [col for col in df_train.columns if 'consumption_ewm_' in col]
+    feature_columns = base_features + lag_cols + rolling_cols + ewm_cols
+    feature_columns = [col for col in feature_columns if col in df_train.columns]
+    
+    X = df_train[feature_columns]
+    y = df_train['consumption']
+    
+    categorical_features = [
+        'hour', 'dayofweek', 'month', 'week_of_year',
+        'is_holiday', 'is_working_weekend', 'is_regular_weekend', 'is_working_day',
+        'is_weekend_or_holiday', 'is_weekend',
+        'is_winter', 'is_spring', 'is_summer', 'is_autumn'
+    ]
+    categorical_features = [col for col in categorical_features if col in X.columns]
+    
+    model = CatBoostRegressor(
+        iterations=300,
+        learning_rate=0.1,
+        depth=6,
+        loss_function='MAPE',
+        cat_features=categorical_features,
+        verbose=False,
+        random_seed=42
+    )
+    model.fit(X, y)
+    return model, feature_columns
+
+def rolling_retrain_test():
+    """Тест с ежемесячным переобучением на скользящем окне 2 года"""
+    print("=== СКОЛЬЗЯЩЕЕ ОКНО + ЕЖЕМЕСЯЧНОЕ ПЕРЕОБУЧЕНИЕ ===")
+    
+    df_full = pd.read_csv(FULL_DATA_FILE)
+    df_full['datetime'] = pd.to_datetime(df_full['datetime'])
+    df_full = df_full.sort_values('datetime')
+    
+    # Начало теста — январь 2025
+    test_start = datetime(2025, 1, 1)
+    test_end = datetime(2025, 12, 31, 23, 59, 59)
+    
+    # История до теста — только 2022 и 2024 (как в обучении)
+    df_history = df_full[df_full['datetime'] < test_start].copy()
+    df_history = df_history[df_history['year'].isin([2022, 2024])]
+    print(f"Исходная история: {len(df_history)} записей (2022 и 2024)")
+    
+    all_results = []
+    monthly_metrics = []
+    
+    # Перебираем месяцы 2025 года
+    for month in range(1, 13):
+        month_start = datetime(2025, month, 1)
+        if month == 12:
+            month_end = datetime(2025, 12, 31, 23, 59, 59)
+        else:
+            month_end = datetime(2025, month + 1, 1) - timedelta(seconds=1)
+        
+        print(f"\nОбработка месяца: {month_start.strftime('%B %Y')}")
+        
+        # Данные за текущий месяц (реальные)
+        df_month_actual = df_full[
+            (df_full['datetime'] >= month_start) & 
+            (df_full['datetime'] <= month_end)
+        ].copy()
+        
+        if len(df_month_actual) == 0:
+            print("  Пропуск: нет данных")
+            continue
+        
+        # === ШАГ 1: Обучение модели на текущей истории (окно ~2 года) ===
+        # Обновляем историю: оставляем только последние ~2 года
+        history_cutoff = month_start - timedelta(days=730)  # ~2 года
+        df_train_window = df_history[df_history['datetime'] >= history_cutoff].copy()
+        
+        # Создаём признаки
+        df_train_features = create_features(df_train_window)
+        df_train_features = df_train_features.dropna()
+        
+        if len(df_train_features) < 1000:
+            print(f"  Предупреждение: мало данных для обучения ({len(df_train_features)})")
+            continue
+        
+        print(f"  Обучение на {len(df_train_features)} записях")
+        model, feature_columns = train_model_on_data(df_train_features)
+        
+        # === ШАГ 2: Прогноз на текущий месяц ===
+        df_month_pred = df_month_actual.copy()
+        df_month_pred = create_features(df_month_pred)
+        
+        # Оставляем только нужные признаки
+        X_pred = df_month_pred[feature_columns]
+        missing_cols = [col for col in feature_columns if col not in X_pred.columns]
+        if missing_cols:
+            print(f"  Пропуск: отсутствуют колонки {missing_cols}")
+            continue
+        
+        predictions = model.predict(X_pred)
+        
+        # Сохраняем результаты
+        results_month = pd.DataFrame({
+            'datetime': df_month_actual['datetime'].values,
+            'actual': df_month_actual['consumption'].values,
+            'predicted': predictions,
+            'month': month
+        })
+        all_results.append(results_month)
+        
+        # Метрики
+        mae = mean_absolute_error(results_month['actual'], results_month['predicted'])
+        mape = mean_absolute_percentage_error(results_month['actual'], results_month['predicted']) * 100
+        monthly_metrics.append({
+            'month': month,
+            'mae': mae,
+            'mape': mape,
+            'count': len(results_month)
+        })
+        print(f"  MAE: {mae:.3f}, MAPE: {mape:.2f}%")
+        
+        # === ШАГ 3: Обновление истории (добавляем реальные данные месяца) ===
+        df_history = pd.concat([df_history, df_month_actual], ignore_index=True)
+        df_history = df_history.sort_values('datetime')
+    
+    # Итоги
+    if all_results:
+        results_df = pd.concat(all_results, ignore_index=True)
+        metrics_df = pd.DataFrame(monthly_metrics)
+        
+        # Графики
+        plt.figure(figsize=(20, 10))
+        plt.subplot(2, 1, 1)
+        plt.plot(results_df['datetime'], results_df['actual'], 'b-', alpha=0.6, label='Реальное')
+        plt.plot(results_df['datetime'], results_df['predicted'], 'r--', alpha=0.6, label='Предсказанное')
+        plt.title('Прогноз с ежемесячным переобучением (2025)')
+        plt.ylabel('Потребление (МВт)')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        
+        plt.subplot(2, 1, 2)
+        plt.bar(metrics_df['month'], metrics_df['mae'], color='orange', alpha=0.7)
+        plt.title('MAE по месяцам')
+        plt.xlabel('Месяц')
+        plt.ylabel('MAE (МВт)')
+        plt.xticks(metrics_df['month'])
+        plt.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.savefig(f'{OUTPUT_DIR}rolling_retrain_results.png', dpi=300)
+        plt.show()
+        
+        # Сохранение
+        results_df.to_csv(f'{OUTPUT_DIR}rolling_retrain_detailed.csv', index=False)
+        metrics_df.to_csv(f'{OUTPUT_DIR}rolling_retrain_monthly.csv', index=False)
+        print(f"\n✅ Результаты сохранены в {OUTPUT_DIR}")
+        return results_df, metrics_df
+    else:
+        print("Нет результатов для сохранения")
+        return None, None
+
+if __name__ == "__main__":
+    rolling_retrain_test()
