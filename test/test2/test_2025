@@ -1,0 +1,203 @@
+# full_test.py
+import pandas as pd
+import numpy as np
+from catboost import CatBoostRegressor
+import matplotlib.pyplot as plt
+from sklearn.metrics import mean_absolute_error, mean_absolute_percentage_error
+from datetime import datetime, timedelta
+import warnings
+warnings.filterwarnings('ignore')
+
+# === КОНСТАНТЫ ===
+MODEL_PATH = 'enhanced_energy_model.cbm'
+FULL_DATA_FILE = 'enhanced_filtered_full_data.csv'
+TRAINING_DATA_FILE = 'enhanced_filtered_training_data.csv'
+OUTPUT_DIR = './full_test_results/'
+
+def load_model_and_data():
+    """Загрузка модели и подготовка данных для полного тестирования"""
+    print("=== ЗАГРУЗКА МОДЕЛИ И ДАННЫХ ===")
+    
+    # Загрузка модели
+    model = CatBoostRegressor()
+    model.load_model(MODEL_PATH)
+    print("Модель успешно загружена")
+    
+    # Загрузка полного датасета (включая сентябрь 2025)
+    df_full = pd.read_csv(FULL_DATA_FILE)
+    df_full['datetime'] = pd.to_datetime(df_full['datetime'])
+    df_full = df_full.sort_values('datetime')
+    print(f"Полный датасет загружен: {len(df_full)} записей")
+    
+    # Загрузка обучающего датасета (без сентября 2025)
+    df_train = pd.read_csv(TRAINING_DATA_FILE)
+    df_train['datetime'] = pd.to_datetime(df_train['datetime'])
+    df_train = df_train.sort_values('datetime')
+    print(f"Обучающий датасет загружен: {len(df_train)} записей")
+    
+    return model, df_full, df_train
+
+def evaluate_model_on_full_dataset(model, df_full, df_train):
+    """Полная оценка модели на всем датасете"""
+    print("\n=== ПОЛНАЯ ОЦЕНКА МОДЕЛИ ===")
+    
+    # Извлекаем признаки, на которых обучалась модель
+    feature_columns = model.feature_names_
+    
+    # Подготавливаем X и y для теста
+    X_full = df_full[feature_columns]
+    y_full = df_full['consumption']
+    
+    # Проверяем, что все колонки присутствуют
+    missing_cols = [col for col in feature_columns if col not in X_full.columns]
+    if missing_cols:
+        print(f"Критическая ошибка: В датасете отсутствуют колонки: {missing_cols}")
+        return None
+    
+    # Делаем предсказание на всем датасете
+    print("Начинаем предсказания на всем датасете...")
+    predictions = model.predict(X_full)
+    
+    # Оценка качества на всем датасете
+    mae_full = mean_absolute_error(y_full, predictions)
+    mape_full = mean_absolute_percentage_error(y_full, predictions) * 100
+    
+    print(f"\n=== ИТОГОВЫЕ РЕЗУЛЬТАТЫ НА ВСЕМ ДАТАСЕТЕ ===")
+    print(f"Количество предсказаний: {len(predictions)}")
+    print(f"MAE: {mae_full:.3f}")
+    print(f"MAPE: {mape_full:.2f}%")
+    
+    # Оценка качества только на обучающем датасете (для сравнения)
+    X_train = df_train[feature_columns]
+    y_train = df_train['consumption']
+    predictions_train = model.predict(X_train)
+    
+    mae_train = mean_absolute_error(y_train, predictions_train)
+    mape_train = mean_absolute_percentage_error(y_train, predictions_train) * 100
+    
+    print(f"\nMAE на обучающем датасете: {mae_train:.3f}")
+    print(f"MAPE на обучающем датасете: {mape_train:.2f}%")
+    
+    # Статистика по годам
+    df_full['year'] = df_full['datetime'].dt.year
+    yearly_results = df_full.groupby('year').apply(
+        lambda x: pd.Series({
+            'MAE': mean_absolute_error(x['consumption'], predictions[x.index]),
+            'MAPE': mean_absolute_percentage_error(x['consumption'], predictions[x.index]) * 100,
+            'Count': len(x)
+        })
+    ).round(3)
+    
+    print(f"\n=== СТАТИСТИКА ПО ГОДАМ ===")
+    print(yearly_results)
+    
+    # Статистика по месяцам для 2025 года
+    df_2025 = df_full[df_full['year'] == 2025].copy()
+    if len(df_2025) > 0:
+        df_2025['month'] = df_2025['datetime'].dt.month
+        monthly_2025_results = df_2025.groupby('month').apply(
+            lambda x: pd.Series({
+                'MAE': mean_absolute_error(x['consumption'], predictions[x.index]),
+                'MAPE': mean_absolute_percentage_error(x['consumption'], predictions[x.index]) * 100,
+                'Count': len(x)
+            })
+        ).round(3)
+        
+        print(f"\n=== СТАТИСТИКА ПО МЕСЯЦАМ (2025 ГОД) ===")
+        print(monthly_2025_results)
+    
+    # Подготовка данных для визуализации
+    results_df = pd.DataFrame({
+        'datetime': df_full['datetime'],
+        'actual_consumption': y_full.values,
+        'predicted_consumption': predictions,
+        'absolute_error': np.abs(y_full.values - predictions),
+        'year': df_full['year']
+    })
+    
+    return results_df, {
+        'overall_mae': mae_full,
+        'overall_mape': mape_full,
+        'yearly_results': yearly_results,
+        'monthly_2025_results': monthly_2025_results if 'monthly_2025_results' in locals() else None
+    }
+
+def plot_full_test_results(results_df, metrics):
+    """Построение графиков полного тестирования"""
+    print("\n=== ПОСТРОЕНИЕ ГРАФИКОВ ===")
+    
+    fig, axes = plt.subplots(3, 1, figsize=(16, 18))
+    
+    # 1. Предсказания vs Реальные значения (сниппет за 30 дней)
+    sample_data = results_df.head(720)  # Первые 30 дней (720 часов)
+    axes[0].plot(sample_data['datetime'], sample_data['actual_consumption'], 
+                 label='Реальное потребление', linewidth=1.5, color='blue')
+    axes[0].plot(sample_data['datetime'], sample_data['predicted_consumption'], 
+                 label='Предсказанное потребление', linewidth=1.5, color='red', linestyle='--')
+    axes[0].set_title('Предсказания vs Реальные значения (первые 30 дней)')
+    axes[0].set_ylabel('Потребление (МВт)')
+    axes[0].legend()
+    axes[0].grid(True, alpha=0.3)
+    axes[0].tick_params(axis='x', rotation=45)
+    
+    # 2. Абсолютные ошибки по времени (усредненные по дням)
+    results_df['date'] = results_df['datetime'].dt.date
+    daily_errors = results_df.groupby('date')['absolute_error'].mean()
+    axes[1].plot(daily_errors.index, daily_errors.values, 
+                 color='green', alpha=0.7, linewidth=1.2)
+    axes[1].set_title('Средняя ошибка по дням')
+    axes[1].set_ylabel('Средняя ошибка (МВт)')
+    axes[1].grid(True, alpha=0.3)
+    axes[1].tick_params(axis='x', rotation=45)
+    
+    # 3. Сравнение MAE по годам
+    if metrics['yearly_results'] is not None:
+        yearly_mae = metrics['yearly_results']['MAE']
+        axes[2].bar(range(len(yearly_mae)), yearly_mae.values, 
+                   color='orange', alpha=0.7)
+        axes[2].set_title('MAE по годам')
+        axes[2].set_ylabel('MAE (МВт)')
+        axes[2].set_xlabel('Год')
+        axes[2].set_xticks(range(len(yearly_mae)))
+        axes[2].set_xticklabels([str(year) for year in yearly_mae.index], rotation=45)
+        axes[2].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(f'{OUTPUT_DIR}full_test_results.png', dpi=300, bbox_inches='tight')
+    print(f"График сохранен в {OUTPUT_DIR}full_test_results.png")
+    plt.show()
+
+def main():
+    import os
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    
+    # Загрузка данных
+    model, df_full, df_train = load_model_and_data()
+    
+    # Оценка модели
+    results_df, metrics = evaluate_model_on_full_dataset(model, df_full, df_train)
+    
+    if results_df is not None:
+        # Построение графиков
+        plot_full_test_results(results_df, metrics)
+        
+        # Сохранение результатов
+        results_df.to_csv(f'{OUTPUT_DIR}full_test_detailed_results.csv', index=False)
+        print(f"Детальные результаты сохранены в {OUTPUT_DIR}full_test_detailed_results.csv")
+        
+        # Сохранение метрик
+        with open(f'{OUTPUT_DIR}full_test_metrics.txt', 'w') as f:
+            f.write(f"Overall MAE: {metrics['overall_mae']:.3f}\n")
+            f.write(f"Overall MAPE: {metrics['overall_mape']:.2f}%\n")
+            f.write("\nYearly Results:\n")
+            f.write(str(metrics['yearly_results']))
+            if metrics['monthly_2025_results'] is not None:
+                f.write(f"\n\nMonthly Results (2025):\n")
+                f.write(str(metrics['monthly_2025_results']))
+        
+        print(f"Метрики сохранены в {OUTPUT_DIR}full_test_metrics.txt")
+    
+    print("\n=== ПОЛНОЕ ТЕСТИРОВАНИЕ ЗАВЕРШЕНО ===")
+
+if __name__ == "__main__":
+    main()
