@@ -1,0 +1,347 @@
+# rolling_window_test.py
+import pandas as pd
+import numpy as np
+from catboost import CatBoostRegressor
+import matplotlib.pyplot as plt
+from sklearn.metrics import mean_absolute_error, mean_absolute_percentage_error
+from datetime import datetime, timedelta
+import warnings
+warnings.filterwarnings('ignore')
+
+# === КОНСТАНТЫ ===
+MODEL_PATH = 'enhanced_energy_model_2_years.cbm'
+FULL_DATA_FILE = 'enhanced_filtered_full_data.csv'
+TRAINING_DATA_FILE = 'enhanced_filtered_training_data.csv'
+OUTPUT_DIR = './rolling_test_results/'
+
+def load_model_and_data():
+    """Загрузка модели и подготовка данных для тестирования с скользящим окном"""
+    print("=== ЗАГРУЗКА МОДЕЛИ И ДАННЫХ ===")
+    
+    # Загрузка модели
+    model = CatBoostRegressor()
+    model.load_model(MODEL_PATH)
+    print("Модель успешно загружена")
+    
+    # Загрузка полного датасета (включая сентябрь 2025)
+    df_full = pd.read_csv(FULL_DATA_FILE)
+    df_full['datetime'] = pd.to_datetime(df_full['datetime'])
+    df_full = df_full.sort_values('datetime')
+    print(f"Полный датасет загружен: {len(df_full)} записей")
+    
+    # Загрузка обучающего датасета (для получения истории)
+    df_train = pd.read_csv(TRAINING_DATA_FILE)
+    df_train['datetime'] = pd.to_datetime(df_train['datetime'])
+    df_train = df_train.sort_values('datetime')
+    print(f"Обучающий датасет загружен: {len(df_train)} записей")
+    
+    return model, df_full, df_train
+
+def create_features_from_history(df_history):
+    """Создание всех признаков на основе истории (аналогично предобработке)"""
+    df = df_history.copy()
+    
+    # Повторяем шаги из предобработки
+    df['hour'] = df['datetime'].dt.hour
+    df['hour_sin'] = np.sin(2 * np.pi * df['hour'] / 24)
+    df['hour_cos'] = np.cos(2 * np.pi * df['hour'] / 24)
+    df['dayofweek'] = df['datetime'].dt.dayofweek
+    df['month'] = df['datetime'].dt.month
+    df['week_of_year'] = df['datetime'].dt.isocalendar().week
+    df['year'] = df['datetime'].dt.year
+    
+    # Сезонные признаки
+    df['season'] = df['month'] % 12 // 3 + 1
+    df['is_winter'] = (df['season'] == 1).astype(int)
+    df['is_spring'] = (df['season'] == 2).astype(int)
+    df['is_summer'] = (df['season'] == 3).astype(int)
+    df['is_autumn'] = (df['season'] == 4).astype(int)
+    df['is_weekend'] = df['dayofweek'].isin([5, 6]).astype(int)
+    
+    # Календарные признаки (предполагаем, что в датасете есть day_type)
+    # Если нет - можно создать на основе dayofweek и holidays
+    if 'is_holiday' not in df.columns:
+        df['is_holiday'] = 0
+        df['is_working_weekend'] = 0
+        df['is_regular_weekend'] = df['is_weekend']
+        df['is_working_day'] = (~df['is_weekend']).astype(int)
+        df['is_weekend_or_holiday'] = df['is_weekend']
+    
+    # Лаговые признаки
+    lag_hours = [1, 2, 3, 24, 48, 72, 120, 168]
+    for lag in lag_hours:
+        df[f'consumption_lag_{lag}'] = df['consumption'].shift(lag)
+    
+    # Скользящие признаки
+    windows = [3, 6, 12, 24, 720]
+    for window in windows:
+        df[f'consumption_rolling_mean_{window}'] = df['consumption'].rolling(window=window).mean()
+        df[f'consumption_rolling_std_{window}'] = df['consumption'].rolling(window=window).std()
+    
+    # EWM признаки
+    spans = [3, 6, 12, 24]
+    for span in spans:
+        df[f'consumption_ewm_mean_{span}'] = df['consumption'].ewm(span=span).mean()
+    
+    return df
+
+def rolling_window_test():
+    """Тестирование модели с использованием скользящего окна"""
+    print("=== ТЕСТИРОВАНИЕ СО СКОЛЬЗЯЩИМ ОКНОМ ===")
+    
+    model, df_full, df_train = load_model_and_data()
+    
+    # Определяем тестовый период: сентябрь 2025
+    test_start = datetime(2025, 9, 1)
+    test_end = datetime(2025, 9, 30)
+    
+    # Фильтруем тестовые данные
+    df_test = df_full[(df_full['datetime'] >= test_start) & (df_full['datetime'] < test_end)]
+    print(f"Тестовый период: {len(df_test)} записей с {test_start} по {test_end}")
+    
+    if len(df_test) == 0:
+        print("Нет данных для тестирования!")
+        return
+    
+    # Извлекаем признаки модели
+    feature_columns = model.feature_names_
+    print(f"Модель обучалась на {len(feature_columns)} признаках")
+    
+    # Объединяем обучающий и тестовый датасет для истории
+    df_combined = pd.concat([df_train, df_test], ignore_index=True)
+    df_combined = df_combined.sort_values('datetime')
+    
+    # Минимальная длина истории для расчета признаков (720 часов = 30 дней)
+    history_length = 720
+    
+    # Проверяем, достаточно ли данных
+    if len(df_combined) < history_length:
+        print(f"Недостаточно данных для истории. Требуется минимум {history_length}, есть {len(df_combined)}")
+        return
+    
+    # Инициализация списков для результатов
+    predictions_1day = []
+    predictions_3day = []
+    actual_values_1day = []
+    actual_values_3day = []
+    prediction_times = []
+    
+    # Для каждого дня в тестовом периоде
+    test_dates = df_test['datetime'].dt.date.unique()
+    print(f"Тестирование на {len(test_dates)} днях...")
+    
+    for i, current_date in enumerate(test_dates):
+        print(f"Обработка дня {i+1}/{len(test_dates)}: {current_date}")
+        
+        # Получаем данные за 30 дней до текущего дня (включая историю)
+        start_hist = datetime.combine(current_date, datetime.min.time()) - timedelta(days=30)
+        end_hist = datetime.combine(current_date, datetime.min.time()) + timedelta(hours=23)
+        
+        df_hist = df_combined[
+            (df_combined['datetime'] >= start_hist) & 
+            (df_combined['datetime'] <= end_hist)
+        ].copy()
+        
+        if len(df_hist) < history_length:
+            print(f"  Недостаточно истории для {current_date}")
+            continue
+        
+        # Создаем все признаки для истории
+        df_hist_features = create_features_from_history(df_hist)
+        
+        # Получаем предсказания на следующие дни
+        for hours_ahead in [1, 3]:  # 1 день = 24 часа, 3 дня = 72 часа
+            # Берем последние 24/72 часа для предсказания
+            if hours_ahead == 1:
+                # Предсказание на следующий день (24 часа)
+                future_start = datetime.combine(current_date + timedelta(days=1), datetime.min.time())
+                future_end = future_start + timedelta(hours=23)
+            else:  # hours_ahead == 3
+                # Предсказание на 3 дня вперед
+                future_start = datetime.combine(current_date + timedelta(days=1), datetime.min.time())
+                future_end = future_start + timedelta(hours=71)  # 72 часа - 1 (включая первый час)
+            
+            # Проверяем, есть ли реальные данные
+            actual_future = df_full[
+                (df_full['datetime'] >= future_start) & 
+                (df_full['datetime'] <= future_end)
+            ]
+            
+            if len(actual_future) == 0:
+                continue
+            
+            # Создаем признаки для каждого часа в будущем
+            # В реальности это сложно, так как лаги требуют будущих значений
+            # Для упрощения: используем исторические данные и предсказываем пошагово
+            
+            # Вместо этого, используем готовые признаки из датасета для конкретного времени
+            for future_time in actual_future['datetime']:
+                # Находим соответствующий момент в истории
+                hist_time = future_time - timedelta(days=365)  # Пример: брать данные из прошлого года
+                
+                # Это упрощение - в реальности нужно пошагово предсказывать
+                # и обновлять лаги для каждого часа
+                
+                # Для настоящего скользящего окна нужно:
+                # 1. Использовать исторические данные до текущего момента
+                # 2. Последовательно предсказывать каждый час, обновляя лаги
+                
+                # Реализация пошагового предсказания
+                current_hist = df_hist_features.copy()
+                
+                # Для каждого часа в будущем
+                prediction_horizon = 24 if hours_ahead == 1 else 72
+                day_predictions = []
+                
+                for hour_step in range(prediction_horizon):
+                    # Берем последние данные для предсказания
+                    last_data = current_hist.tail(1)
+                    
+                    if len(last_data) == 0:
+                        break
+                    
+                    # Подготавливаем признаки для предсказания
+                    try:
+                        X_pred = last_data[feature_columns]
+                        pred = model.predict(X_pred)[0]
+                        day_predictions.append(pred)
+                        
+                        # Создаем новую строку с предсказанным значением
+                        # и обновляем признаки (упрощенно)
+                        new_row = last_data.copy()
+                        new_row['datetime'] = new_row['datetime'].iloc[0] + timedelta(hours=1)
+                        new_row['consumption'] = pred  # Используем предсказание как новое значение
+                        
+                        # Обновляем признаки для новой строки (упрощенно)
+                        # На практике нужно пересчитать все лаги, скользящие средние и т.д.
+                        
+                        # Добавляем в историю
+                        current_hist = pd.concat([current_hist, new_row], ignore_index=True)
+                        
+                    except Exception as e:
+                        print(f"  Ошибка при предсказании: {e}")
+                        break
+                
+                # Сравниваем с реальными значениями
+                actual_values = actual_future['consumption'].iloc[:len(day_predictions)].values
+                
+                if len(day_predictions) > 0 and len(actual_values) > 0:
+                    if hours_ahead == 1:
+                        predictions_1day.extend(day_predictions)
+                        actual_values_1day.extend(actual_values)
+                        prediction_times.extend(actual_future['datetime'].iloc[:len(day_predictions)].tolist())
+                    else:
+                        predictions_3day.extend(day_predictions)
+                        actual_values_3day.extend(actual_values)
+                        # Для 3-дневных предсказаний используем отдельный список
+    
+    # Возвращаем результаты
+    results_1day = pd.DataFrame({
+        'datetime': prediction_times[:len(predictions_1day)],
+        'actual': actual_values_1day,
+        'predicted': predictions_1day
+    }) if predictions_1day else pd.DataFrame()
+    
+    results_3day = pd.DataFrame({
+        'datetime': prediction_times[:len(predictions_3day)],
+        'actual': actual_values_3day,
+        'predicted': predictions_3day
+    }) if predictions_3day else pd.DataFrame()
+    
+    return results_1day, results_3day
+
+def evaluate_and_plot_results(results_1day, results_3day):
+    """Оценка и визуализация результатов"""
+    print("\n=== ОЦЕНКА И ВИЗУАЛИЗАЦИЯ РЕЗУЛЬТАТОВ ===")
+    
+    import os
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    
+    # Оценка 1-дневного предсказания
+    if len(results_1day) > 0:
+        mae_1day = mean_absolute_error(results_1day['actual'], results_1day['predicted'])
+        mape_1day = mean_absolute_percentage_error(results_1day['actual'], results_1day['predicted']) * 100
+        
+        print(f"1-дневное предсказание:")
+        print(f"  MAE: {mae_1day:.3f}")
+        print(f"  MAPE: {mape_1day:.2f}%")
+        print(f"  Количество точек: {len(results_1day)}")
+    else:
+        print("Нет данных для 1-дневного предсказания")
+    
+    # Оценка 3-дневного предсказания
+    if len(results_3day) > 0:
+        mae_3day = mean_absolute_error(results_3day['actual'], results_3day['predicted'])
+        mape_3day = mean_absolute_percentage_error(results_3day['actual'], results_3day['predicted']) * 100
+        
+        print(f"3-дневное предсказание:")
+        print(f"  MAE: {mae_3day:.3f}")
+        print(f"  MAPE: {mape_3day:.2f}%")
+        print(f"  Количество точек: {len(results_3day)}")
+    else:
+        print("Нет данных для 3-дневного предсказания")
+    
+    # Построение графиков
+    fig, axes = plt.subplots(2, 2, figsize=(20, 12))
+    
+    # 1. 1-дневное предсказание
+    if len(results_1day) > 0:
+        axes[0, 0].plot(results_1day['datetime'], results_1day['actual'], label='Реальное', linewidth=1, alpha=0.8)
+        axes[0, 0].plot(results_1day['datetime'], results_1day['predicted'], label='Предсказанное', linewidth=1, alpha=0.8)
+        axes[0, 0].set_title(f'1-дневное предсказание (MAE: {mae_1day:.3f})')
+        axes[0, 0].set_ylabel('Потребление (МВт)')
+        axes[0, 0].legend()
+        axes[0, 0].grid(True, alpha=0.3)
+        axes[0, 0].tick_params(axis='x', rotation=45)
+    
+    # 2. Ошибки 1-дневного предсказания
+    if len(results_1day) > 0:
+        errors_1day = np.abs(results_1day['actual'] - results_1day['predicted'])
+        axes[0, 1].plot(results_1day['datetime'], errors_1day, color='red', alpha=0.7, linewidth=1)
+        axes[0, 1].set_title(f'Ошибки 1-дневного предсказания (MAE: {mae_1day:.3f})')
+        axes[0, 1].set_ylabel('Ошибка (МВт)')
+        axes[0, 1].grid(True, alpha=0.3)
+        axes[0, 1].tick_params(axis='x', rotation=45)
+    
+    # 3. 3-дневное предсказание
+    if len(results_3day) > 0:
+        axes[1, 0].plot(results_3day['datetime'], results_3day['actual'], label='Реальное', linewidth=1, alpha=0.8)
+        axes[1, 0].plot(results_3day['datetime'], results_3day['predicted'], label='Предсказанное', linewidth=1, alpha=0.8)
+        axes[1, 0].set_title(f'3-дневное предсказание (MAE: {mae_3day:.3f})')
+        axes[1, 0].set_ylabel('Потребление (МВт)')
+        axes[1, 0].set_xlabel('Дата и время')
+        axes[1, 0].legend()
+        axes[1, 0].grid(True, alpha=0.3)
+        axes[1, 0].tick_params(axis='x', rotation=45)
+    
+    # 4. Ошибки 3-дневного предсказания
+    if len(results_3day) > 0:
+        errors_3day = np.abs(results_3day['actual'] - results_3day['predicted'])
+        axes[1, 1].plot(results_3day['datetime'], errors_3day, color='red', alpha=0.7, linewidth=1)
+        axes[1, 1].set_title(f'Ошибки 3-дневного предсказания (MAE: {mae_3day:.3f})')
+        axes[1, 1].set_ylabel('Ошибка (МВт)')
+        axes[1, 1].set_xlabel('Дата и время')
+        axes[1, 1].grid(True, alpha=0.3)
+        axes[1, 1].tick_params(axis='x', rotation=45)
+    
+    plt.tight_layout()
+    plt.savefig(f'{OUTPUT_DIR}rolling_window_test_results.png', dpi=300, bbox_inches='tight')
+    print(f"Графики сохранены в {OUTPUT_DIR}rolling_window_test_results.png")
+    plt.show()
+    
+    # Сохранение результатов
+    if len(results_1day) > 0:
+        results_1day.to_csv(f'{OUTPUT_DIR}rolling_1day_predictions.csv', index=False)
+    if len(results_3day) > 0:
+        results_3day.to_csv(f'{OUTPUT_DIR}rolling_3day_predictions.csv', index=False)
+    
+    print(f"Результаты сохранены в {OUTPUT_DIR}")
+
+def main():
+    """Основная функция тестирования"""
+    results_1day, results_3day = rolling_window_test()
+    evaluate_and_plot_results(results_1day, results_3day)
+    print("\n=== ТЕСТИРОВАНИЕ СО СКОЛЬЗЯЩИМ ОКНОМ ЗАВЕРШЕНО ===")
+
+if __name__ == "__main__":
+    main()
