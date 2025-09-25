@@ -1,0 +1,237 @@
+preprocessing_no_weather.py
+import pandas as pd
+import numpy as np
+from datetime import datetime
+import warnings
+warnings.filterwarnings('ignore')
+
+# === КОНСТАНТЫ ===
+CONSUMPTION_FILE = 'consumption_data.csv'
+CALENDAR_FILE = 'russian_production_calendar_2017_2025.csv'
+OUTPUT_FILE = 'enhanced_filtered_no_weather.csv'
+
+def load_and_merge_data():
+    # Загрузка основных данных
+    df = pd.read_csv(CONSUMPTION_FILE, sep=';', encoding='utf-8')
+    print("Столбцы в consumption_data.csv:", df.columns.tolist())
+
+    # Создание datetime
+    df['datetime'] = pd.to_datetime(df['date']) + pd.to_timedelta(df['hour'], unit='h')
+    df = df.sort_values('datetime').reset_index(drop=True)
+
+    # Загрузка календаря
+    calendar = pd.read_csv(CALENDAR_FILE)
+    print("Столбцы в календаре:", calendar.columns.tolist())
+    calendar['date'] = pd.to_datetime(calendar['date']).dt.date
+
+    # Объединение
+    df['date_only'] = df['datetime'].dt.date
+    df = df.merge(calendar, left_on='date_only', right_on='date', how='left')
+    df = df.drop(columns=['date_only'])
+
+    # Обработка температуры
+    if 'temparature_forecast' in df.columns:
+        df['temperature'] = df['temparature_forecast'].fillna(method='ffill').fillna(method='bfill')
+    elif 'temperature' in df.columns:
+        df['temperature'] = df['temperature'].fillna(method='ffill').fillna(method='bfill')
+    else:
+        df['temperature'] = 0  # Заглушка, если температура отсутствует
+
+    # Преобразование consumption
+    df['consumption'] = pd.to_numeric(df['consumption'], errors='coerce')
+
+    # Создание бинарных признаков из day_type
+    df['is_holiday'] = (df['day_type'] == 'non-working holiday').astype(int)
+    df['is_working_weekend'] = (df['day_type'] == 'working weekend').astype(int)
+    df['is_regular_weekend'] = (df['day_type'] == 'weekend').astype(int)
+    df['is_working_day'] = (df['day_type'] == 'working day').astype(int)
+    df['is_weekend_or_holiday'] = df[['is_holiday', 'is_regular_weekend']].max(axis=1)
+
+    # Выбор нужных столбцов
+    df = df[['datetime', 'consumption', 'temperature', 'is_holiday', 'is_working_weekend',
+             'is_regular_weekend', 'is_working_day', 'is_weekend_or_holiday']].copy()
+
+    df['year'] = df['datetime'].dt.year
+    df = df.dropna()
+    return df
+
+def create_features(df):
+    df = df.copy()
+    df['hour'] = df['datetime'].dt.hour
+    df['hour_sin'] = np.sin(2 * np.pi * df['hour'] / 24)
+    df['hour_cos'] = np.cos(2 * np.pi * df['hour'] / 24)
+    df['dayofweek'] = df['datetime'].dt.dayofweek
+    df['month'] = df['datetime'].dt.month
+    df['week_of_year'] = df['datetime'].dt.isocalendar().week
+
+    season = df['month'] % 12 // 3 + 1
+    df['is_winter'] = (season == 1).astype(int)
+    df['is_spring'] = (season == 2).astype(int)
+    df['is_summer'] = (season == 3).astype(int)
+    df['is_autumn'] = (season == 4).astype(int)
+    df['is_weekend'] = df['dayofweek'].isin([5, 6]).astype(int)
+
+    lag_hours = [1, 2, 3, 24, 48, 72]
+    for lag in lag_hours:
+        df[f'consumption_lag_{lag}'] = df['consumption'].shift(lag)
+
+    windows = [3, 6, 12, 24, 720]
+    for w in windows:
+        df[f'consumption_rolling_mean_{w}'] = df['consumption'].rolling(w).mean()
+        df[f'consumption_rolling_std_{w}'] = df['consumption'].rolling(w).std()
+
+    spans = [3, 6, 12, 24]
+    for s in spans:
+        df[f'consumption_ewm_mean_{s}'] = df['consumption'].ewm(span=s).mean()
+
+    return df
+
+def main():
+    df = load_and_merge_data()
+    df = create_features(df)
+    df = df.dropna()
+    df.to_csv(OUTPUT_FILE, index=False)
+    print(f"Данные без погоды сохранены в {OUTPUT_FILE}")
+
+if __name__ == "__main__":
+    main()
+
+
+preprocessing_with_ww_encoded.py
+
+import pandas as pd
+import numpy as np
+from datetime import datetime
+import warnings
+warnings.filterwarnings('ignore')
+
+# === КОНСТАНТЫ ===
+CONSUMPTION_FILE = 'consumption_data.csv'
+WEATHER_FILE = 'weather_data.csv'
+CALENDAR_FILE = 'russian_production_calendar_2017_2025.csv'
+OUTPUT_FILE = 'enhanced_filtered_with_ww_encoded.csv'
+
+def load_and_merge_data():
+    # Загрузка основных данных
+    df = pd.read_csv(CONSUMPTION_FILE, sep=';', encoding='utf-8')
+    print("Столбцы в consumption_data.csv:", df.columns.tolist())
+
+    # Создание datetime
+    df['datetime'] = pd.to_datetime(df['date']) + pd.to_timedelta(df['hour'], unit='h')
+    df = df.sort_values('datetime').reset_index(drop=True)
+    df['date_only'] = df['datetime'].dt.date
+
+    # Преобразование consumption
+    df['consumption'] = pd.to_numeric(df['consumption'], errors='coerce')
+
+    # Загрузка календаря
+    calendar = pd.read_csv(CALENDAR_FILE)
+    print("Столбцы в календаре:", calendar.columns.tolist())
+    calendar['date'] = pd.to_datetime(calendar['date']).dt.date
+    df = df.merge(calendar, left_on='date_only', right_on='date', how='left')
+    df = df.drop(columns=['date_only'])
+
+    # Объединение с погодой
+    weather = pd.read_csv(WEATHER_FILE, sep=';', encoding='utf-8')
+    print("Столбцы в weather_data.csv:", weather.columns.tolist())
+
+    weather['datetime'] = pd.to_datetime(weather['Местное время в Архангельске / им. Ф. А. Абрамова (аэропорт)'], dayfirst=True)
+    weather = weather[['datetime', 'T', 'U', 'Ff', 'WW', 'W\'W\'']].copy()
+    weather = weather.rename(columns={
+        'T': 'temperature',
+        'U': 'humidity',
+        'Ff': 'wind_speed',
+        'WW': 'weather_event',
+        'W\'W\'': 'weather_event2'
+    })
+
+    # Обработка строковых данных
+    for col in ['temperature', 'humidity', 'wind_speed']:
+        if col in weather.columns:
+            weather[col] = pd.to_numeric(weather[col], errors='coerce')
+
+    # Объединение
+    df = df.merge(weather[['datetime', 'temperature', 'humidity', 'wind_speed', 'weather_event', 'weather_event2']], on='datetime', how='left')
+
+    # Кодировка WW и W'W'
+    all_ww = df['weather_event'].dropna().unique()
+    all_ww2 = df['weather_event2'].dropna().unique()
+
+    ww_map = {val: idx + 1 for idx, val in enumerate(all_ww)}
+    ww2_map = {val: idx + 1 for idx, val in enumerate(all_ww2)}
+
+    df['weather_event_encoded'] = df['weather_event'].map(ww_map).fillna(0).astype(int)
+    df['weather_event2_encoded'] = df['weather_event2'].map(ww2_map).fillna(0).astype(int)
+
+    print("Кодировка WW:")
+    for k, v in ww_map.items():
+        print(f"{v}: {k}")
+    print("\nКодировка W'W':")
+    for k, v in ww2_map.items():
+        print(f"{v}: {k}")
+
+    with open('weather_event_encoding.txt', 'w', encoding='utf-8') as f:
+        f.write("Кодировка WW:\n")
+        for k, v in ww_map.items():
+            f.write(f"{v}: {k}\n")
+        f.write("\nКодировка W'W':\n")
+        for k, v in ww2_map.items():
+            f.write(f"{v}: {k}\n")
+
+    # Бинарные признаки из day_type
+    df['is_holiday'] = (df['day_type'] == 'non-working holiday').astype(int)
+    df['is_working_weekend'] = (df['day_type'] == 'working weekend').astype(int)
+    df['is_regular_weekend'] = (df['day_type'] == 'weekend').astype(int)
+    df['is_working_day'] = (df['day_type'] == 'working day').astype(int)
+    df['is_weekend_or_holiday'] = df[['is_holiday', 'is_regular_weekend']].max(axis=1)
+
+    # Выбор нужных столбцов
+    df = df[['datetime', 'consumption', 'temperature', 'humidity', 'wind_speed',
+             'weather_event_encoded', 'weather_event2_encoded',
+             'is_holiday', 'is_working_weekend', 'is_regular_weekend', 'is_working_day',
+             'is_weekend_or_holiday']].copy()
+
+    df['year'] = df['datetime'].dt.year
+    df = df.dropna(subset=['consumption'])
+    return df
+
+def create_features(df):
+    df = df.copy()
+    df['hour'] = df['datetime'].dt.hour
+    df['hour_sin'] = np.sin(2 * np.pi * df['hour'] / 24)
+    df['hour_cos'] = np.cos(2 * np.pi * df['hour'] / 24)
+    df['dayofweek'] = df['datetime'].dt.dayofweek
+    df['month'] = df['datetime'].dt.month
+    df['week_of_year'] = df['datetime'].dt.isocalendar().week
+
+    season = df['month'] % 12 // 3 + 1
+    df['is_winter'] = (season == 1).astype(int)
+    df['is_spring'] = (season == 2).astype(int)
+    df['is_summer'] = (season == 3).astype(int)
+    df['is_autumn'] = (season == 4).astype(int)
+    df['is_weekend'] = df['dayofweek'].isin([5, 6]).astype(int)
+
+    lag_hours = [1, 2, 3, 24, 48, 72]
+    for lag in lag_hours:
+        df[f'consumption_lag_{lag}'] = df['consumption'].shift(lag)
+
+    windows = [3, 6, 12, 24, 720]
+    for w in windows:
+        df[f'consumption_rolling_mean_{w}'] = df['consumption'].rolling(w).mean()
+        df[f'consumption_rolling_std_{w}'] = df['consumption'].rolling(w).std()
+
+    spans = [3, 6, 12, 24]
+    for s in spans:
+        df[f'consumption_ewm_mean_{s}'] = df['consumption'].ewm(span=s).mean()
+
+    return df
+
+def main():
+    df = load_and_merge_data()
+    df = create_features(df)
+    df = df.dropna()
+    df.to_csv(OUTPUT_FILE, index=False)
+    print(f"Данные с закодированными WW/W'W' сохранены в {OUTPUT_FILE}")
+
+if __name__ == "__main__":
+    main()
