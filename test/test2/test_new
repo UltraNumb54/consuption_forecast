@@ -1,0 +1,214 @@
+# realistic_rolling_test.py
+import pandas as pd
+import numpy as np
+from catboost import CatBoostRegressor
+import matplotlib.pyplot as plt
+from sklearn.metrics import mean_absolute_error, mean_absolute_percentage_error
+from datetime import datetime, timedelta
+import warnings
+warnings.filterwarnings('ignore')
+
+# === КОНСТАНТЫ ===
+MODEL_PATH = 'enhanced_energy_model_2_years.cbm'  # Модель, обученная на 2022 и 2024
+FULL_DATA_FILE = 'enhanced_filtered_full_data.csv'  # Полный датасет с 2025
+TRAINING_DATA_FILE = 'enhanced_filtered_training_data.csv'  # Только 2022 и 2024
+OUTPUT_DIR = './realistic_test_results/'
+
+def load_model_and_data():
+    """Загрузка модели и данных"""
+    print("=== ЗАГРУЗКА МОДЕЛИ И ДАННЫХ ===")
+    model = CatBoostRegressor()
+    model.load_model(MODEL_PATH)
+    print("Модель загружена")
+
+    df_full = pd.read_csv(FULL_DATA_FILE)
+    df_full['datetime'] = pd.to_datetime(df_full['datetime'])
+    df_full = df_full.sort_values('datetime')
+
+    df_train = pd.read_csv(TRAINING_DATA_FILE)
+    df_train['datetime'] = pd.to_datetime(df_train['datetime'])
+    df_train = df_train.sort_values('datetime')
+
+    return model, df_full, df_train
+
+def create_features_for_single_row(row, df_history):
+    """Создание признаков для одного часа на основе истории"""
+    # Базовые признаки времени
+    dt = row['datetime']
+    features = {
+        'hour': dt.hour,
+        'dayofweek': dt.dayofweek,
+        'month': dt.month,
+        'week_of_year': dt.isocalendar().week,
+        'year': dt.year,
+        'hour_sin': np.sin(2 * np.pi * dt.hour / 24),
+        'hour_cos': np.cos(2 * np.pi * dt.hour / 24),
+    }
+    # Сезон
+    season = features['month'] % 12 // 3 + 1
+    features.update({
+        'is_winter': int(season == 1),
+        'is_spring': int(season == 2),
+        'is_summer': int(season == 3),
+        'is_autumn': int(season == 4),
+        'is_weekend': int(features['dayofweek'] in [5, 6])
+    })
+    # Календарные признаки (берем из row, так как они уже в датасете)
+    for col in ['is_holiday', 'is_working_weekend', 'is_regular_weekend', 
+                'is_working_day', 'is_weekend_or_holiday']:
+        features[col] = row.get(col, 0)
+    
+    # Погода (берем из row — как идеальный прогноз)
+    for col in ['temperature', 'humidity', 'wind_speed']:
+        features[col] = row.get(col, df_history[col].mean() if col in df_history.columns else 0)
+
+    # Лаги и скользящие окна — из истории
+    consumption_hist = df_history['consumption'].values
+    lag_hours = [1, 2, 3, 24, 48, 72, 120, 168]
+    for lag in lag_hours:
+        if len(consumption_hist) >= lag:
+            features[f'consumption_lag_{lag}'] = consumption_hist[-lag]
+        else:
+            features[f'consumption_lag_{lag}'] = np.nan
+
+    # Скользящие окна
+    windows = [3, 6, 12, 24, 720]
+    for window in windows:
+        if len(consumption_hist) >= window:
+            features[f'consumption_rolling_mean_{window}'] = np.mean(consumption_hist[-window:])
+            features[f'consumption_rolling_std_{window}'] = np.std(consumption_hist[-window:])
+        else:
+            features[f'consumption_rolling_mean_{window}'] = np.nan
+            features[f'consumption_rolling_std_{window}'] = np.nan
+
+    # EWM (упрощенно — берем последнее значение из истории или среднее)
+    spans = [3, 6, 12, 24]
+    for span in spans:
+        if len(consumption_hist) > 0:
+            # Простое приближение EWM
+            features[f'consumption_ewm_mean_{span}'] = consumption_hist[-1]
+        else:
+            features[f'consumption_ewm_mean_{span}'] = np.nan
+
+    return features
+
+def realistic_rolling_test():
+    """Реалистичное тестирование с последовательным прогнозированием"""
+    print("=== РЕАЛИСТИЧНОЕ ТЕСТИРОВАНИЕ НА 2025 ГОД ===")
+    model, df_full, df_train = load_model_and_data()
+    
+    # Определяем период теста: весь 2025 год
+    test_start = datetime(2025, 1, 1)
+    test_end = datetime(2025, 12, 31, 23, 59, 59)
+    df_test = df_full[(df_full['datetime'] >= test_start) & (df_full['datetime'] <= test_end)]
+    print(f"Тестовый период: {len(df_test)} часов")
+
+    # История до теста
+    df_history = df_train[df_train['datetime'] < test_start].copy()
+    df_history = df_history.sort_values('datetime')
+    print(f"История до теста: {len(df_history)} часов")
+
+    if len(df_history) == 0:
+        raise ValueError("Нет исторических данных до 2025 года!")
+
+    # Инициализация
+    predictions = []
+    actuals = []
+    datetimes = []
+    feature_columns = model.feature_names_
+
+    # Последовательное прогнозирование
+    for idx, row in df_test.iterrows():
+        # Создаем признаки для текущего часа
+        features = create_features_for_single_row(row, df_history)
+        
+        # Создаем DataFrame для предсказания
+        X_pred = pd.DataFrame([features])
+        # Заполняем пропуски
+        for col in feature_columns:
+            if col not in X_pred.columns:
+                X_pred[col] = df_history[col].mean() if col in df_history.columns else 0
+        X_pred = X_pred[feature_columns]
+        
+        # Предсказание
+        pred = model.predict(X_pred)[0]
+        
+        # Сохраняем результат
+        predictions.append(pred)
+        actuals.append(row['consumption'])
+        datetimes.append(row['datetime'])
+        
+        # Обновляем историю: добавляем реальное значение (как если бы мы его узнали)
+        new_row = row.copy()
+        new_row['consumption'] = row['consumption']  # Реальное значение
+        df_history = pd.concat([df_history, pd.DataFrame([new_row])], ignore_index=True)
+        df_history = df_history.sort_values('datetime')
+
+    # Создаем результаты
+    results_df = pd.DataFrame({
+        'datetime': datetimes,
+        'actual': actuals,
+        'predicted': predictions
+    })
+    return results_df
+
+def evaluate_and_plot(results_df):
+    """Оценка и визуализация"""
+    import os
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    
+    # Общая оценка
+    mae = mean_absolute_error(results_df['actual'], results_df['predicted'])
+    mape = mean_absolute_percentage_error(results_df['actual'], results_df['predicted']) * 100
+    print(f"Итоговая MAE: {mae:.3f}")
+    print(f"Итоговая MAPE: {mape:.2f}%")
+
+    # По месяцам
+    results_df['month'] = results_df['datetime'].dt.month
+    monthly = results_df.groupby('month').apply(
+        lambda x: pd.Series({
+            'mae': mean_absolute_error(x['actual'], x['predicted']),
+            'mape': mean_absolute_percentage_error(x['actual'], x['predicted']) * 100,
+            'count': len(x)
+        })
+    )
+    print("\nMAE по месяцам:")
+    print(monthly[['mae', 'mape']])
+
+    # Графики
+    plt.figure(figsize=(20, 12))
+    
+    # 1. Полный год
+    plt.subplot(2, 1, 1)
+    plt.plot(results_df['datetime'], results_df['actual'], 'b-', alpha=0.7, label='Реальное')
+    plt.plot(results_df['datetime'], results_df['predicted'], 'r--', alpha=0.7, label='Предсказанное')
+    plt.title(f'Прогноз на 2025 год (MAE: {mae:.3f})')
+    plt.ylabel('Потребление (МВт)')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+
+    # 2. Ошибки по месяцам
+    plt.subplot(2, 1, 2)
+    plt.bar(monthly.index, monthly['mae'], color='orange', alpha=0.7)
+    plt.title('MAE по месяцам')
+    plt.xlabel('Месяц')
+    plt.ylabel('MAE (МВт)')
+    plt.xticks(monthly.index)
+    plt.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(f'{OUTPUT_DIR}realistic_test_2025.png', dpi=300, bbox_inches='tight')
+    plt.show()
+
+    # Сохранение
+    results_df.to_csv(f'{OUTPUT_DIR}realistic_test_2025_detailed.csv', index=False)
+    monthly.to_csv(f'{OUTPUT_DIR}realistic_test_2025_monthly.csv')
+    print(f"Результаты сохранены в {OUTPUT_DIR}")
+
+def main():
+    results = realistic_rolling_test()
+    evaluate_and_plot(results)
+    print("Тестирование завершено!")
+
+if __name__ == "__main__":
+    main()
