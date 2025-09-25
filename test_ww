@@ -1,0 +1,304 @@
+import pandas as pd
+import numpy as np
+from datetime import datetime
+import warnings
+warnings.filterwarnings('ignore')
+
+# === КОНСТАНТЫ ===
+CONSUMPTION_FILE = 'consumption_data.csv'
+WEATHER_FILE = 'weather_data.csv'
+CALENDAR_FILE = 'russian_production_calendar_2017_2025.csv'
+OUTPUT_FILE = 'enhanced_filtered_with_ww_encoded.csv'
+
+def load_and_merge_data():
+    # Загрузка потребления
+    df = pd.read_csv(CONSUMPTION_FILE, sep=';', encoding='utf-8')
+    df['datetime'] = pd.to_datetime(df['date']) + pd.to_timedelta(df['hour'], unit='h')
+    df = df.sort_values('datetime').reset_index(drop=True)
+    df['date_only'] = df['datetime'].dt.date
+    df['consumption'] = df['consumption'].str.replace(',', '.').astype(float)
+
+    # Загрузка календаря
+    calendar = pd.read_csv(CALENDAR_FILE)
+    calendar['date'] = pd.to_datetime(calendar['date']).dt.date
+    df = df.merge(calendar, left_on='date_only', right_on='date', how='left')
+    df = df.drop(columns=['date_only', 'date'])
+
+    # Типы дней
+    df['is_holiday'] = (df['day_type'] == 'non-working holiday').astype(int)
+    df['is_working_weekend'] = (df['day_type'] == 'working weekend').astype(int)
+    df['is_regular_weekend'] = (df['day_type'] == 'weekend').astype(int)
+    df['is_working_day'] = (df['day_type'] == 'working day').astype(int)
+    df['is_weekend_or_holiday'] = df[['is_holiday', 'is_regular_weekend']].max(axis=1)
+
+    # Загрузка погоды
+    weather = pd.read_csv(WEATHER_FILE, sep=';', encoding='utf-8')
+    weather['datetime'] = pd.to_datetime(weather['Местное время в Архангельске / им. Ф. А. Абрамова (аэропорт)'], dayfirst=True)
+    weather = weather[['datetime', 'T', 'U', 'Ff', 'WW', 'W\'W\'']].copy()
+    weather = weather.rename(columns={'T': 'temperature', 'U': 'humidity', 'Ff': 'wind_speed', 'WW': 'weather_event', 'W\'W\'': 'weather_event2'})
+
+    # Заполнение пропусков
+    weather['temperature'] = weather['temperature'].str.replace(',', '.').astype(float)
+    weather['humidity'] = weather['humidity'].str.replace(',', '.').astype(float)
+    weather['wind_speed'] = weather['wind_speed'].str.replace(',', '.').astype(float)
+
+    # Объединение
+    df = df.merge(weather[['datetime', 'temperature', 'humidity', 'wind_speed', 'weather_event', 'weather_event2']], on='datetime', how='left')
+
+    # Заполнение температуры из основного датасета
+    df['temperature'] = df['temperature'].fillna(df['temperature'])
+
+    # Кодирование WW и W'W'
+    all_ww = df['weather_event'].dropna().unique()
+    all_ww2 = df['weather_event2'].dropna().unique()
+
+    # Словари кодирования
+    ww_map = {val: idx + 1 for idx, val in enumerate(all_ww)}
+    ww2_map = {val: idx + 1 for idx, val in enumerate(all_ww2)}
+
+    # Присваиваем 0, если нет явления
+    df['weather_event_encoded'] = df['weather_event'].map(ww_map).fillna(0).astype(int)
+    df['weather_event2_encoded'] = df['weather_event2'].map(ww2_map).fillna(0).astype(int)
+
+    # Вывод уникальных значений
+    print("Кодировка WW:")
+    for k, v in ww_map.items():
+        print(f"{v}: {k}")
+    print("\nКодировка W'W':")
+    for k, v in ww2_map.items():
+        print(f"{v}: {k}")
+
+    # Сохраняем в файл
+    with open('weather_event_encoding.txt', 'w', encoding='utf-8') as f:
+        f.write("Кодировка WW:\n")
+        for k, v in ww_map.items():
+            f.write(f"{v}: {k}\n")
+        f.write("\nКодировка W'W':\n")
+        for k, v in ww2_map.items():
+            f.write(f"{v}: {k}\n")
+
+    df = df.dropna(subset=['consumption'])  # только у потребления
+    return df
+
+def create_features(df):
+    df = df.copy()
+    df['hour'] = df['datetime'].dt.hour
+    df['hour_sin'] = np.sin(2 * np.pi * df['hour'] / 24)
+    df['hour_cos'] = np.cos(2 * np.pi * df['hour'] / 24)
+    df['dayofweek'] = df['datetime'].dt.dayofweek
+    df['month'] = df['datetime'].dt.month
+    df['week_of_year'] = df['datetime'].dt.isocalendar().week
+
+    season = df['month'] % 12 // 3 + 1
+    df['is_winter'] = (season == 1).astype(int)
+    df['is_spring'] = (season == 2).astype(int)
+    df['is_summer'] = (season == 3).astype(int)
+    df['is_autumn'] = (season == 4).astype(int)
+    df['is_weekend'] = df['dayofweek'].isin([5, 6]).astype(int)
+
+    # Лаги
+    lag_hours = [1, 2, 3, 24, 48, 72]
+    for lag in lag_hours:
+        df[f'consumption_lag_{lag}'] = df['consumption'].shift(lag)
+
+    # Скользящие
+    windows = [3, 6, 12, 24, 720]
+    for w in windows:
+        df[f'consumption_rolling_mean_{w}'] = df['consumption'].rolling(w).mean()
+        df[f'consumption_rolling_std_{w}'] = df['consumption'].rolling(w).std()
+
+    # EWM
+    spans = [3, 6, 12, 24]
+    for s in spans:
+        df[f'consumption_ewm_mean_{s}'] = df['consumption'].ewm(span=s).mean()
+
+    return df
+
+def main():
+    df = load_and_merge_data()
+    df = create_features(df)
+    df = df.dropna()
+    df.to_csv(OUTPUT_FILE, index=False)
+    print(f"Данные с закодированными WW/W'W' сохранены в {OUTPUT_FILE}")
+
+if __name__ == "__main__":
+    main()
+
+import pandas as pd
+import numpy as np
+from catboost import CatBoostRegressor
+import matplotlib.pyplot as plt
+from sklearn.metrics import mean_absolute_error, mean_absolute_percentage_error
+from datetime import datetime, timedelta
+import os
+import warnings
+warnings.filterwarnings('ignore')
+
+# === КОНСТАНТЫ ===
+FULL_DATA_FILE = 'enhanced_filtered_with_ww_encoded.csv'
+OUTPUT_DIR = './test_with_ww_encoded/'
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+def get_feature_columns():
+    base_features = [
+        'hour', 'hour_sin', 'hour_cos', 'dayofweek', 'month', 'week_of_year',
+        'temperature', 'humidity', 'wind_speed',
+        'weather_event_encoded', 'weather_event2_encoded',  # добавлены закодированные
+        'is_holiday', 'is_working_weekend', 'is_regular_weekend', 'is_working_day',
+        'is_weekend_or_holiday', 'is_weekend',
+        'is_winter', 'is_spring', 'is_summer', 'is_autumn'
+    ]
+    return base_features
+
+def create_features(df):
+    df = df.copy()
+    df['hour'] = df['datetime'].dt.hour
+    df['hour_sin'] = np.sin(2 * np.pi * df['hour'] / 24)
+    df['hour_cos'] = np.cos(2 * np.pi * df['hour'] / 24)
+    df['dayofweek'] = df['datetime'].dt.dayofweek
+    df['month'] = df['datetime'].dt.month
+    df['week_of_year'] = df['datetime'].dt.isocalendar().week
+
+    season = df['month'] % 12 // 3 + 1
+    df['is_winter'] = (season == 1).astype(int)
+    df['is_spring'] = (season == 2).astype(int)
+    df['is_summer'] = (season == 3).astype(int)
+    df['is_autumn'] = (season == 4).astype(int)
+    df['is_weekend'] = df['dayofweek'].isin([5, 6]).astype(int)
+
+    lag_hours = [1, 2, 3, 24, 48, 72]
+    for lag in lag_hours:
+        df[f'consumption_lag_{lag}'] = df['consumption'].shift(lag)
+
+    windows = [3, 6, 12, 24, 720]
+    for w in windows:
+        df[f'consumption_rolling_mean_{w}'] = df['consumption'].rolling(w).mean()
+        df[f'consumption_rolling_std_{w}'] = df['consumption'].rolling(w).std()
+
+    spans = [3, 6, 12, 24]
+    for s in spans:
+        df[f'consumption_ewm_mean_{s}'] = df['consumption'].ewm(span=s).mean()
+
+    return df
+
+def train_model_on_data(df_train):
+    base_features = get_feature_columns()
+    lag_cols = [col for col in df_train.columns if 'consumption_lag_' in col]
+    rolling_cols = [col for col in df_train.columns if 'consumption_rolling_' in col]
+    ewm_cols = [col for col in df_train.columns if 'consumption_ewm_' in col]
+    feature_columns = base_features + lag_cols + rolling_cols + ewm_cols
+    feature_columns = [col for col in feature_columns if col in df_train.columns]
+
+    X = df_train[feature_columns]
+    y = df_train['consumption']
+
+    categorical_features = [
+        'hour', 'dayofweek', 'month', 'week_of_year',
+        'weather_event_encoded', 'weather_event2_encoded',  # добавлено
+        'is_holiday', 'is_working_weekend', 'is_regular_weekend', 'is_working_day',
+        'is_weekend_or_holiday', 'is_weekend',
+        'is_winter', 'is_spring', 'is_summer', 'is_autumn'
+    ]
+    categorical_features = [col for col in categorical_features if col in X.columns]
+
+    model = CatBoostRegressor(
+        iterations=300,
+        learning_rate=0.1,
+        depth=6,
+        loss_function='MAPE',
+        cat_features=categorical_features,
+        verbose=False,
+        random_seed=42
+    )
+    model.fit(X, y)
+    return model, feature_columns
+
+def test_model():
+    print("=== ТЕСТИРОВАНИЕ МОДЕЛИ С ЗАКОДИРОВАННЫМИ WW/W'W' ===")
+    df_full = pd.read_csv(FULL_DATA_FILE)
+    df_full['datetime'] = pd.to_datetime(df_full['datetime'])
+    df_full = df_full.sort_values('datetime')
+
+    # Тест — сентябрь 2025
+    test_start = datetime(2025, 9, 1)
+    test_end = datetime(2025, 9, 30, 23, 59, 59)
+    df_test = df_full[(df_full['datetime'] >= test_start) & (df_full['datetime'] <= test_end)].copy()
+
+    # Обучение на 2022 и 2024
+    df_train = df_full[df_full['year'].isin([2022, 2024])].copy()
+    df_train = create_features(df_train)
+    df_train = df_train.dropna()
+
+    print(f"Обучение на {len(df_train)} записях")
+    model, feature_columns = train_model_on_data(df_train)
+
+    df_test = create_features(df_test)
+    X_test = df_test[feature_columns]
+    predictions = model.predict(X_test)
+
+    results = pd.DataFrame({
+        'datetime': df_test['datetime'],
+        'actual': df_test['consumption'],
+        'predicted': predictions
+    })
+
+    mae = mean_absolute_error(results['actual'], results['predicted'])
+    mape = mean_absolute_percentage_error(results['actual'], results['predicted']) * 100
+    print(f"MAE: {mae:.3f}, MAPE: {mape:.2f}%")
+
+    # Визуализация
+    plt.figure(figsize=(15, 6))
+    plt.plot(results['datetime'], results['actual'], label='Реальное', alpha=0.8)
+    plt.plot(results['datetime'], results['predicted'], label='Прогноз', linestyle='--', alpha=0.8)
+    plt.title('Прогноз с закодированными WW/W\'W\' — сентябрь 2025')
+    plt.ylabel('Потребление (МВт)')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(f'{OUTPUT_DIR}with_ww_encoded_september.png', dpi=300)
+    plt.show()
+
+    results.to_csv(f'{OUTPUT_DIR}with_ww_encoded_results.csv', index=False)
+    print(f"Результаты сохранены в {OUTPUT_DIR}")
+
+if __name__ == "__main__":
+    test_model()
+
+
+def get_feature_columns():
+    base_features = [
+        'hour', 'hour_sin', 'hour_cos', 'dayofweek', 'month', 'week_of_year',
+        'temperature',
+        'is_holiday', 'is_working_weekend', 'is_regular_weekend', 'is_working_day',
+        'is_weekend_or_holiday', 'is_weekend',
+        'is_winter', 'is_spring', 'is_summer', 'is_autumn'
+    ]
+    return base_features
+
+categorical_features = [
+    'hour', 'dayofweek', 'month', 'week_of_year',
+    'is_holiday', 'is_working_weekend', 'is_regular_weekend', 'is_working_day',
+    'is_weekend_or_holiday', 'is_weekend',
+    'is_winter', 'is_spring', 'is_summer', 'is_autumn'
+]
+
+with encoded
+
+def get_feature_columns():
+    base_features = [
+        'hour', 'hour_sin', 'hour_cos', 'dayofweek', 'month', 'week_of_year',
+        'temperature', 'humidity', 'wind_speed',
+        'weather_event_encoded', 'weather_event2_encoded',  # добавлены закодированные
+        'is_holiday', 'is_working_weekend', 'is_regular_weekend', 'is_working_day',
+        'is_weekend_or_holiday', 'is_weekend',
+        'is_winter', 'is_spring', 'is_summer', 'is_autumn'
+    ]
+    return base_features
+
+categorical_features = [
+    'hour', 'dayofweek', 'month', 'week_of_year',
+    'weather_event_encoded', 'weather_event2_encoded',  # добавлены закодированные
+    'is_holiday', 'is_working_weekend', 'is_regular_weekend', 'is_working_day',
+    'is_weekend_or_holiday', 'is_weekend',
+    'is_winter', 'is_spring', 'is_summer', 'is_autumn'
+]
