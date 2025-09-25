@@ -1,0 +1,299 @@
+# final_check.py
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from datetime import datetime, timedelta
+import warnings
+warnings.filterwarnings('ignore')
+
+# === КОНСТАНТЫ ===
+PROCESSED_TRAINING_FILE = 'enhanced_filtered_training_data.csv'
+PROCESSED_FULL_FILE = 'enhanced_filtered_full_data.csv'
+CONSUMPTION_FILE = 'consumption_data.csv'
+WEATHER_FILE = 'weather_data.csv'
+
+def load_data():
+    """Загрузка всех необходимых датасетов"""
+    print("=== ЗАГРУЗКА ДАННЫХ ===")
+    
+    # Загрузка финальных датасетов
+    try:
+        df_train = pd.read_csv(PROCESSED_TRAINING_FILE)
+        df_train['datetime'] = pd.to_datetime(df_train['datetime'])
+        print(f"Датасет для обучения загружен: {len(df_train)} строк, {len(df_train.columns)} колонок")
+    except FileNotFoundError:
+        print(f"Ошибка: Файл {PROCESSED_TRAINING_FILE} не найден!")
+        df_train = None
+
+    try:
+        df_full = pd.read_csv(PROCESSED_FULL_FILE)
+        df_full['datetime'] = pd.to_datetime(df_full['datetime'])
+        print(f"Полный датасет загружен: {len(df_full)} строк, {len(df_full.columns)} колонок")
+    except FileNotFoundError:
+        print(f"Ошибка: Файл {PROCESSED_FULL_FILE} не найден!")
+        df_full = None
+
+    # Загрузка исходных файлов для проверки
+    try:
+        df_cons = pd.read_csv(CONSUMPTION_FILE, sep=';', parse_dates=['date'])
+        df_cons['datetime'] = pd.to_datetime(df_cons['date']) + pd.to_timedelta(df_cons['hour'], unit='h')
+        print(f"Исходный датасет потребления загружен: {len(df_cons)} строк")
+    except FileNotFoundError:
+        print(f"Ошибка: Файл {CONSUMPTION_FILE} не найден!")
+        df_cons = None
+
+    try:
+        # Загрузка погоды (аналогично из preproccesing.py)
+        with open(WEATHER_FILE, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        header_line = None
+        data_start = 0
+        for i, line in enumerate(lines):
+            if line.strip().startswith('"Местное время'):
+                header_line = line.strip()
+                data_start = i + 1
+                break
+        if header_line is None:
+            print("Ошибка: Не найдена строка с заголовком в файле погоды")
+            df_weather = None
+        else:
+            df_weather = pd.read_csv(
+                WEATHER_FILE, 
+                sep=';', 
+                skiprows=data_start,
+                on_bad_lines='skip',
+                encoding='utf-8'
+            )
+            if len(df_weather) == 0:
+                print("Ошибка: Файл погоды пуст!")
+                df_weather = None
+            else:
+                df_weather['datetime'] = pd.to_datetime(df_weather.iloc[:, 0], dayfirst=True)
+                print(f"Исходный датасет погоды загружен: {len(df_weather)} строк")
+    except FileNotFoundError:
+        print(f"Ошибка: Файл {WEATHER_FILE} не найден!")
+        df_weather = None
+
+    return df_train, df_full, df_cons, df_weather
+
+def check_temperature_source(df_final, df_cons):
+    """Проверка, что температура в финальном датасете взята из файла потребления"""
+    print("\n=== ПРОВЕРКА ИСТОЧНИКА ТЕМПЕРАТУРЫ ===")
+    
+    if df_final is None or df_cons is None:
+        print("Не все датасеты загружены для проверки температуры.")
+        return
+
+    # Проверим, есть ли колонка temperature в финальном датасете
+    if 'temperature' not in df_final.columns:
+        print("❌ ОШИБКА: Колонка 'temperature' отсутствует в финальном датасете!")
+        return
+
+    # Сравним значения температуры за один день
+    sample_date = df_final['date_only'].iloc[0]
+    print(f"Проверяем температуру за {sample_date}...")
+    
+    temp_final = df_final[df_final['date_only'] == sample_date][['datetime', 'temperature']].sort_values('datetime')
+    temp_cons = df_cons[df_cons['date'] == pd.to_datetime(sample_date)][['datetime', 'temperature']].sort_values('datetime')
+
+    if len(temp_final) == len(temp_cons) and len(temp_final) > 0:
+        # Сравниваем значения
+        merged_check = pd.merge(temp_final, temp_cons, on='datetime', suffixes=('_final', '_cons'))
+        merged_check['match'] = np.isclose(merged_check['temperature_final'], merged_check['temperature_cons'], equal_nan=True)
+        
+        if merged_check['match'].all():
+            print(f"✅ Температура в финальном датасете совпадает с исходным файлом потребления для {sample_date}.")
+            print(f"   Примеры из финального датасета:")
+            print(merged_check[['datetime', 'temperature_final']].head(5))
+        else:
+            print(f"❌ ОШИБКА: Температура в финальном датасете НЕ совпадает с исходным файлом потребления для {sample_date}.")
+            print(merged_check[['datetime', 'temperature_final', 'temperature_cons', 'match']])
+    else:
+        print(f"⚠️  Не совпадает количество записей для {sample_date}. Финальный: {len(temp_final)}, Исходный: {len(temp_cons)}")
+
+def check_feature_groups(df):
+    """Проверка наличия всех групп признаков"""
+    print("\n=== ПРОВЕРКА НАЛИЧИЯ ГРУПП ПРИЗНАКОВ ===")
+    
+    if df is None:
+        print("Датасет недоступен для проверки.")
+        return
+
+    # Группы признаков
+    time_features = ['hour', 'dayofweek', 'month', 'week_of_year', 'year', 'hour_sin', 'hour_cos']
+    seasonal_features = ['season', 'is_winter', 'is_spring', 'is_summer', 'is_autumn']
+    calendar_features = ['is_holiday', 'is_working_weekend', 'is_regular_weekend', 'is_working_day', 'is_weekend_or_holiday', 'is_weekend']
+    weather_features = ['temperature', 'humidity', 'wind_speed']
+    lag_features = [col for col in df.columns if 'consumption_lag_' in col]
+    rolling_features = [col for col in df.columns if 'consumption_rolling_' in col]
+    ewm_features = [col for col in df.columns if 'consumption_ewm_' in col]
+
+    all_features = (
+        time_features + seasonal_features + calendar_features + 
+        weather_features + lag_features + rolling_features + ewm_features
+    )
+
+    missing_base_features = [f for f in time_features + seasonal_features + calendar_features + weather_features if f not in df.columns]
+    missing_lag = len(lag_features) == 0
+    missing_rolling = len(rolling_features) == 0
+    missing_ewm = len(ewm_features) == 0
+
+    print(f"  Временные признаки (hour, dayofweek и т.д.): {'✅' if all(f in df.columns for f in time_features) else '❌'}")
+    print(f"  Сезонные признаки (season, is_winter и т.д.): {'✅' if all(f in df.columns for f in seasonal_features) else '❌'}")
+    print(f"  Календарные признаки (is_holiday и т.д.): {'✅' if all(f in df.columns for f in calendar_features) else '❌'}")
+    print(f"  Погодные признаки (temperature, humidity, wind_speed): {'✅' if all(f in df.columns for f in weather_features) else '❌'}")
+    print(f"  Лаговые признаки (consumption_lag_): {'✅' if not missing_lag else '❌'} (найдено {len(lag_features)})")
+    print(f"  Скользящие признаки (consumption_rolling_): {'✅' if not missing_rolling else '❌'} (найдено {len(rolling_features)})")
+    print(f"  EWM признаки (consumption_ewm_): {'✅' if not missing_ewm else '❌'} (найдено {len(ewm_features)})")
+
+    if missing_base_features:
+        print(f"  ⚠️  Отсутствуют базовые признаки: {missing_base_features}")
+    if missing_lag:
+        print("  ⚠️  Отсутствуют лаговые признаки.")
+    if missing_rolling:
+        print("  ⚠️  Отсутствуют скользящие признаки.")
+    if missing_ewm:
+        print("  ⚠️  Отсутствуют EWM признаки.")
+
+    total_found = sum([
+        all(f in df.columns for f in time_features),
+        all(f in df.columns for f in seasonal_features),
+        all(f in df.columns for f in calendar_features),
+        all(f in df.columns for f in weather_features),
+        not missing_lag, not missing_rolling, not missing_ewm
+    ])
+    print(f"  Итого: {total_found}/7 групп признаков присутствует.")
+
+def display_examples(df):
+    """Вывод примеров данных"""
+    print("\n=== ПРИМЕРЫ ДАННЫХ ИЗ ФИНАЛЬНОГО ДАТАСЕТА ===")
+    if df is None:
+        print("Датасет недоступен для вывода примеров.")
+        return
+
+    print("Первые 5 строк:")
+    print(df.head(5)[['datetime', 'consumption', 'temperature', 'humidity', 'wind_speed', 'is_holiday', 'is_weekend']].to_string())
+    
+    print("\nПоследние 5 строк:")
+    print(df.tail(5)[['datetime', 'consumption', 'temperature', 'humidity', 'wind_speed', 'is_holiday', 'is_weekend']].to_string())
+
+def display_statistics(df):
+    """Вывод статистики по датасету"""
+    print("\n=== СТАТИСТИКА ПО ФИНАЛЬНОМУ ДАТАСЕТУ ===")
+    if df is None:
+        print("Датасет недоступен для вывода статистики.")
+        return
+
+    print(f"Размер датасета: {df.shape[0]} строк, {df.shape[1]} колонок")
+    print(f"Период данных: с {df['datetime'].min()} по {df['datetime'].max()}")
+    print(f"Количество лет: {df['year'].nunique()}")
+    print(f"Используемые годы: {sorted(df['year'].unique().tolist())}")
+    print(f"Количество месяцев: {df['datetime'].dt.to_period('M').nunique()}")
+    
+    print("\nОсновные статистики по ключевым колонкам:")
+    key_cols = ['consumption', 'temperature', 'humidity', 'wind_speed']
+    for col in key_cols:
+        if col in df.columns:
+            print(f"  {col}:")
+            print(f"    - Среднее: {df[col].mean():.3f}")
+            print(f"    - Медиана: {df[col].median():.3f}")
+            print(f"    - Std: {df[col].std():.3f}")
+            print(f"    - Min: {df[col].min():.3f}")
+            print(f"    - Max: {df[col].max():.3f}")
+            print(f"    - Пропуски: {df[col].isna().sum()} ({df[col].isna().sum() / len(df) * 100:.2f}%)")
+
+def plot_data_overview(df_train, df_full):
+    """Построение графиков обзора данных"""
+    print("\n=== ПОСТРОЕНИЕ ГРАФИКОВ ОБЗОРА ===")
+    if df_train is None:
+        print("Датасет для обучения недоступен для построения графиков.")
+        return
+
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    
+    # 1. Потребление за время (обучающий датасет)
+    axes[0, 0].plot(df_train['datetime'], df_train['consumption'], label='Потребление (обучение)', linewidth=0.5)
+    axes[0, 0].set_title('Потребление по времени (Обучающий датасет)')
+    axes[0, 0].set_xlabel('Дата')
+    axes[0, 0].set_ylabel('Потребление (МВт)')
+    axes[0, 0].grid(True, alpha=0.3)
+    axes[0, 0].tick_params(axis='x', rotation=45)
+
+    # 2. Температура за время (обучающий датасет)
+    axes[0, 1].plot(df_train['datetime'], df_train['temperature'], label='Температура', color='orange', linewidth=0.5)
+    axes[0, 1].set_title('Температура по времени (Обучающий датасет)')
+    axes[0, 1].set_xlabel('Дата')
+    axes[0, 1].set_ylabel('Температура (°C)')
+    axes[0, 1].grid(True, alpha=0.3)
+    axes[0, 1].tick_params(axis='x', rotation=45)
+
+    # 3. Распределение потребления
+    axes[1, 0].hist(df_train['consumption'], bins=50, edgecolor='black', alpha=0.7)
+    axes[1, 0].set_title('Распределение потребления')
+    axes[1, 0].set_xlabel('Потребление (МВт)')
+    axes[1, 0].set_ylabel('Частота')
+    axes[1, 0].grid(True, alpha=0.3)
+
+    # 4. Корреляция между потреблением и температурой
+    axes[1, 1].scatter(df_train['temperature'], df_train['consumption'], alpha=0.3, s=1)
+    axes[1, 1].set_title('Корреляция: Температура vs Потребление')
+    axes[1, 1].set_xlabel('Температура (°C)')
+    axes[1, 1].set_ylabel('Потребление (МВт)')
+    axes[1, 1].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig('final_dataset_overview.png', dpi=300, bbox_inches='tight')
+    print("График обзора данных сохранен в 'final_dataset_overview.png'")
+    plt.show()
+
+def plot_feature_importance_example(df_train):
+    """Пример важности признаков (если модель обучалась и файл важности есть)"""
+    try:
+        import matplotlib.pyplot as plt
+        # Попытаемся загрузить файл важности признаков, созданный при обучении
+        # Но если его нет, просто покажем, как выглядят признаки в датасете
+        feature_names = df_train.columns.tolist()
+        if 'consumption' in feature_names:
+            feature_names.remove('consumption') # Целевая переменная не важна
+        
+        print(f"\n=== ПРИМЕР СТРУКТУРЫ ПРИЗНАКОВ (ТОП-20) ===")
+        print("Первые 20 признаков в датасете (исключая целевую переменную 'consumption'):")
+        for i, feat in enumerate(feature_names[:20], 1):
+            print(f"  {i:2d}. {feat}")
+        
+        # Создадим синтетический график важности на основе количества пропусков (для демонстрации)
+        missing_counts = df_train[feature_names].isnull().sum()
+        top_features_for_plot = missing_counts.nsmallest(15).index
+        plt.figure(figsize=(10, 8))
+        plt.barh(range(len(top_features_for_plot)), [100 - (missing_counts[f] / len(df_train) * 100) for f in top_features_for_plot])
+        plt.yticks(range(len(top_features_for_plot)), top_features_for_plot)
+        plt.xlabel('Полнота данных (%)')
+        plt.title('Полнота данных по признакам (100% - без пропусков)')
+        plt.gca().invert_yaxis()
+        plt.tight_layout()
+        plt.savefig('feature_completeness_example.png', dpi=300, bbox_inches='tight')
+        print("Пример графика полноты признаков сохранен в 'feature_completeness_example.png'")
+        plt.show()
+
+    except ImportError:
+        print("\nmatplotlib не установлен, пропускаем построение графика важности.")
+    except Exception as e:
+        print(f"\nОшибка при построении графика важности: {e}")
+
+def main():
+    print("=== ЗАПУСК ПРОВЕРКИ ФИНАЛЬНОГО ДАТАСЕТА ===")
+    
+    df_train, df_full, df_cons, df_weather = load_data()
+
+    check_temperature_source(df_train if df_train is not None else df_full, df_cons)
+    check_feature_groups(df_train if df_train is not None else df_full)
+    display_examples(df_train if df_train is not None else df_full)
+    display_statistics(df_train if df_train is not None else df_full)
+    plot_data_overview(df_train, df_full)
+    plot_feature_importance_example(df_train if df_train is not None else df_full)
+
+    print("\n=== ПРОВЕРКА ЗАВЕРШЕНА ===")
+
+if __name__ == "__main__":
+    main()
