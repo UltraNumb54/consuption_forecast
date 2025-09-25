@@ -1,0 +1,365 @@
+# full_preprocessing.py
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+import warnings
+warnings.filterwarnings('ignore')
+
+# === КОНСТАНТЫ ===
+CONSUMPTION_FILE = 'consumption_data.csv'
+WEATHER_FILE = 'weather_data.csv'
+CALENDAR_FILE = 'russian_production_calendar_2017_2025.csv'
+OUTPUT_FILE = 'enhanced_processed_energy_data.csv'
+FILTERED_TRAINING_FILE = 'enhanced_filtered_training_data.csv'
+FILTERED_FULL_FILE = 'enhanced_filtered_full_data.csv'
+
+def preprocess_consumption_data():
+    """Предобработка данных по потреблению"""
+    print("Загрузка данных по потреблению...")
+    try:
+        df_consumption = pd.read_csv(CONSUMPTION_FILE, sep=';', parse_dates=['date'])
+    except FileNotFoundError:
+        print(f"Ошибка: Файл {CONSUMPTION_FILE} не найден!")
+        return None
+    
+    # Преобразуем дату + час в datetime
+    df_consumption['datetime'] = pd.to_datetime(df_consumption['date']) + pd.to_timedelta(df_consumption['hour'], unit='h')
+    
+    # Удаляем строки с пропусками в ключевых полях
+    df_consumption = df_consumption.dropna(subset=['consumption', 'temperature'])
+    
+    # Удаляем температурный прогноз
+    if 'temperature_forecast' in df_consumption.columns:
+        df_consumption = df_consumption.drop(columns=['temperature_forecast'])
+    
+    # Создаем базовые признаки
+    df_consumption['date_only'] = df_consumption['datetime'].dt.date
+    df_consumption['hour'] = df_consumption['datetime'].dt.hour
+    df_consumption['dayofweek'] = df_consumption['datetime'].dt.dayofweek
+    df_consumption['month'] = df_consumption['datetime'].dt.month
+    df_consumption['year'] = df_consumption['datetime'].dt.year
+    df_consumption['week_of_year'] = df_consumption['datetime'].dt.isocalendar().week
+    
+    # Циклические признаки для часа
+    df_consumption['hour_sin'] = np.sin(2 * np.pi * df_consumption['hour'] / 24)
+    df_consumption['hour_cos'] = np.cos(2 * np.pi * df_consumption['hour'] / 24)
+    
+    # Признак времени года
+    df_consumption['season'] = df_consumption['month'] % 12 // 3 + 1
+    df_consumption['is_winter'] = (df_consumption['season'] == 1).astype(int)
+    df_consumption['is_spring'] = (df_consumption['season'] == 2).astype(int)
+    df_consumption['is_summer'] = (df_consumption['season'] == 3).astype(int)
+    df_consumption['is_autumn'] = (df_consumption['season'] == 4).astype(int)
+    
+    df_consumption['is_weekend'] = df_consumption['dayofweek'].isin([5, 6]).astype(int)
+    
+    print(f"Данные по потреблению обработаны. Размер: {len(df_consumption)}")
+    return df_consumption
+
+def preprocess_weather_data():
+    """Предобработка данных по погоде (без температуры)"""
+    print("Загрузка данных по погоде...")
+    try:
+        with open(WEATHER_FILE, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        
+        header_line = None
+        data_start = 0
+        for i, line in enumerate(lines):
+            if line.strip().startswith('"Местное время'):
+                header_line = line.strip()
+                data_start = i + 1
+                break
+        
+        if header_line is None:
+            print("Ошибка: Не найдена строка с заголовком в файле погоды")
+            return None
+        
+        df_weather = pd.read_csv(
+            WEATHER_FILE, 
+            sep=';', 
+            skiprows=data_start,
+            on_bad_lines='skip',
+            encoding='utf-8'
+        )
+        
+        if len(df_weather) == 0:
+            print("Ошибка: Файл погоды пуст!")
+            return None
+            
+    except FileNotFoundError:
+        print(f"Ошибка: Файл {WEATHER_FILE} не найден!")
+        return None
+    except Exception as e:
+        print(f"Ошибка при загрузке файла погоды: {e}")
+        return None
+
+    # Приведение к стандартному формату
+    if len(df_weather.columns) >= 13:
+        column_names = [
+            'datetime', 'T', 'P0', 'P', 'U', 'DD', 'Ff', 'ff10', 
+            'WW', 'WW2', 'clouds', 'VV', 'Td'
+        ]
+        actual_columns = df_weather.columns[:13]
+        df_weather = df_weather[actual_columns]
+        df_weather.columns = column_names[:len(actual_columns)]
+    else:
+        expected_names = ['datetime', 'T', 'P0', 'P', 'U', 'Ff', 'ff10', 'WW', 'WW2', 'clouds', 'VV', 'Td']
+        for i, col in enumerate(df_weather.columns[:len(expected_names)]):
+            df_weather = df_weather.rename(columns={col: expected_names[i]})
+
+    try:
+        df_weather['datetime'] = pd.to_datetime(df_weather['datetime'], dayfirst=True)
+    except:
+        try:
+            df_weather['datetime'] = pd.to_datetime(df_weather.iloc[:, 0], dayfirst=True)
+        except Exception as e:
+            print(f"Ошибка при преобразовании даты: {e}")
+            return None
+
+    # Берем только влажность и ветер. Температура (T) не берётся.
+    required_columns = ['datetime', 'U', 'Ff']
+    existing_columns = [col for col in required_columns if col in df_weather.columns]
+    if len(existing_columns) < 2:
+        print("Ошибка: Не найдены необходимые колонки (U, Ff) в файле погоды")
+        return None
+    
+    df_weather = df_weather[existing_columns]
+    df_weather = df_weather.rename(columns={'U': 'humidity', 'Ff': 'wind_speed'})
+    
+    # Усредним по часам
+    df_weather['datetime'] = df_weather['datetime'].dt.floor('H')
+    df_weather = df_weather.groupby('datetime').mean().reset_index()
+    
+    print(f"Данные по погоде обработаны. Размер: {len(df_weather)}")
+    return df_weather
+
+def load_calendar():
+    """Загрузка существующего производственного календаря"""
+    print("Загрузка производственного календаря...")
+    try:
+        df_calendar = pd.read_csv(CALENDAR_FILE)
+        df_calendar['date'] = pd.to_datetime(df_calendar['date']).dt.date
+        return df_calendar
+    except FileNotFoundError:
+        print(f"Ошибка: Файл {CALENDAR_FILE} не найден!")
+        return None
+
+def create_lag_features(df, lag_hours=None):
+    """Создание лаговых признаков"""
+    if lag_hours is None:
+        lag_hours = [1, 2, 3, 24, 48, 72, 120, 168]
+    print("Создание лаговых признаков...")
+    for lag in lag_hours:
+        df[f'consumption_lag_{lag}'] = df['consumption'].shift(lag)
+    return df
+
+def create_rolling_features(df, windows=None):
+    """Создание скользящих признаков (среднее и стандартное отклонение)"""
+    if windows is None:
+        windows = [3, 6, 12, 24, 720]
+    print("Создание скользящих признаков...")
+    for window in windows:
+        df[f'consumption_rolling_mean_{window}'] = df['consumption'].rolling(window=window).mean()
+        df[f'consumption_rolling_std_{window}'] = df['consumption'].rolling(window=window).std()
+    return df
+
+def create_ewm_features(df, spans=None):
+    """Создание признаков экспоненциального сглаживания"""
+    if spans is None:
+        spans = [3, 6, 12, 24]
+    print("Создание признаков экспоненциального сглаживания...")
+    for span in spans:
+        df[f'consumption_ewm_mean_{span}'] = df['consumption'].ewm(span=span).mean()
+    return df
+
+def load_and_filter_quality_data(include_september=False):
+    """Загрузка и фильтрация данных по качеству"""
+    print("=== ФИЛЬТРАЦИЯ ДАННЫХ ПО КАЧЕСТВУ ===")
+    
+    # Загружаем предварительно обработанные данные
+    try:
+        df = pd.read_csv(OUTPUT_FILE)
+        df['datetime'] = pd.to_datetime(df['datetime'])
+    except FileNotFoundError:
+        print(f"Ошибка: Файл {OUTPUT_FILE} не найден! Запустите сначала основную предобработку.")
+        return None
+    
+    print(f"Исходные данные: {len(df)} записей")
+    df['year'] = df['datetime'].dt.year
+    df['month'] = df['datetime'].dt.month
+    
+    # Исключаем 2023 год из-за отсутствия погодных данных
+    problematic_years = [2023]
+    df_filtered = df[~df['year'].isin(problematic_years)]
+    print(f"После фильтрации проблемных лет: {len(df_filtered)} записей")
+    
+    # Исключаем сентябрь 2025 ТОЛЬКО если include_september=False
+    if not include_september:
+        df_filtered = df_filtered[
+            ~((df_filtered['year'] == 2025) & (df_filtered['month'] == 9))
+        ]
+        print(f"После исключения сентября 2025: {len(df_filtered)} записей")
+    
+    # Фильтр по полноте данных (должно быть > 80% данных по погоде)
+    df_filtered['year_month'] = df_filtered['datetime'].dt.to_period('M')
+    monthly_stats = df_filtered.groupby('year_month').agg({
+        'consumption': 'count',
+        'temperature': lambda x: x.notna().sum(),
+        'humidity': lambda x: x.notna().sum(),
+        'wind_speed': lambda x: x.notna().sum()
+    }).rename(columns={'consumption': 'total_records'})
+    
+    monthly_stats['temp_completeness'] = monthly_stats['temperature'] / monthly_stats['total_records']
+    monthly_stats['humidity_completeness'] = monthly_stats['humidity'] / monthly_stats['total_records']
+    monthly_stats['wind_completeness'] = monthly_stats['wind_speed'] / monthly_stats['total_records']
+    
+    # Фильтр: все погодные параметры должны быть заполнены > 80%
+    good_months = monthly_stats[
+        (monthly_stats['temp_completeness'] > 0.8) &
+        (monthly_stats['humidity_completeness'] > 0.8) &
+        (monthly_stats['wind_completeness'] > 0.8)
+    ].index
+    
+    df_filtered = df_filtered[df_filtered['year_month'].isin(good_months)]
+    print(f"После фильтрации по полноте: {len(df_filtered)} записей")
+    
+    return df_filtered
+
+def handle_missing_values(df):
+    """Обработка пропусков в данных"""
+    print("=== ОБРАБОТКА ПРОПУСКОВ ===")
+    missing_stats = df.isnull().sum()
+    for col, count in missing_stats[missing_stats > 0].items():
+        print(f"  {col}: {count} ({count/len(df)*100:.2f}%)")
+    
+    # Колонки для обработки
+    weather_cols = ['temperature', 'humidity', 'wind_speed']
+    lag_cols = [col for col in df.columns if 'consumption_lag_' in col]
+    rolling_cols = [col for col in df.columns if 'consumption_rolling_' in col]
+    ewm_cols = [col for col in df.columns if 'consumption_ewm_' in col]
+    
+    # Интерполяция погодных данных
+    for col in weather_cols:
+        if col in df.columns:
+            df[col] = df.groupby(df['datetime'].dt.date)[col].transform(
+                lambda x: x.interpolate(method='linear', limit=3, limit_direction='both')
+            )
+            hourly_mean = df.groupby('hour')[col].transform('mean')
+            df[col] = df[col].fillna(hourly_mean)
+    
+    # Интерполяция лаговых и скользящих признаков
+    for col in lag_cols + rolling_cols + ewm_cols:
+        df[col] = df[col].interpolate(method='linear', limit_direction='both')
+    
+    # Финальное заполнение медианой
+    all_cols = weather_cols + lag_cols + rolling_cols + ewm_cols
+    for col in all_cols:
+        if col in df.columns:
+            df[col] = df[col].fillna(df[col].median())
+    
+    print("Пропуски после обработки:")
+    missing_stats = df.isnull().sum()
+    for col, count in missing_stats[missing_stats > 0].items():
+        print(f"  {col}: {count} ({count/len(df)*100:.2f}%)")
+    
+    return df
+
+def create_final_dataset():
+    """Создание финального датасета для обучения И полного датасета для тестирования"""
+    print("=== СОЗДАНИЕ ФИНАЛЬНЫХ ДАТАСЕТОВ ===")
+    
+    # Загружаем ПОЛНЫЙ набор качественных данных (включая сентябрь 2025)
+    df_full = load_and_filter_quality_data(include_september=True)
+    if df_full is None:
+        return None, None
+    
+    df_full = handle_missing_values(df_full)
+    
+    # Удаляем оставшиеся строки с пропусками в критических колонках
+    critical_cols = ['consumption', 'temperature', 'humidity', 'wind_speed']
+    df_full = df_full.dropna(subset=[col for col in critical_cols if col in df_full.columns])
+    
+    print(f"Полный отфильтрованный датасет: {len(df_full)} записей")
+    
+    # Создаем датасет для обучения (исключаем сентябрь 2025)
+    df_for_training = df_full[~((df_full['year'] == 2025) & (df_full['month'] == 9))]
+    print(f"Датасет для обучения (без сентября 2025): {len(df_for_training)} записей")
+    
+    # Сохраняем оба файла
+    df_for_training.to_csv(FILTERED_TRAINING_FILE, index=False)
+    df_full.to_csv(FILTERED_FULL_FILE, index=False)
+    
+    print(f"Датасет для обучения сохранен в {FILTERED_TRAINING_FILE}")
+    print(f"Полный датасет (для теста) сохранен в {FILTERED_FULL_FILE}")
+    
+    # Статистика
+    print(f"Статистика по датасету для обучения:")
+    print(f"   Период: {df_for_training['datetime'].min()} - {df_for_training['datetime'].max()}")
+    print(f"   Количество лет: {df_for_training['year'].nunique()}")
+    print(f"   Используемые годы: {sorted(df_for_training['year'].unique().tolist())}")
+    
+    print(f"Статистика по полному датасету:")
+    print(f"   Период: {df_full['datetime'].min()} - {df_full['datetime'].max()}")
+    print(f"   Количество лет: {df_full['year'].nunique()}")
+    print(f"   Используемые годы: {sorted(df_full['year'].unique().tolist())}")
+    
+    return df_for_training, df_full
+
+def main():
+    """Основная функция полной предобработки"""
+    print("=== НАЧАЛО ПОЛНОЙ ПРЕДОБРАБОТКИ ДАННЫХ ===")
+    
+    df_consumption = preprocess_consumption_data()
+    if df_consumption is None:
+        return
+    
+    df_weather = preprocess_weather_data()
+    if df_weather is None:
+        return
+    
+    df_calendar = load_calendar()
+    if df_calendar is None:
+        return
+    
+    print("Объединение датасетов...")
+    # Объединяем с погодой (только влажность и ветер)
+    df_merged = pd.merge(df_consumption, df_weather, on='datetime', how='left')
+    df_merged['date_for_merge'] = pd.to_datetime(df_merged['date_only'])
+    df_calendar['date_for_merge'] = pd.to_datetime(df_calendar['date'])
+    df_final = pd.merge(df_merged, df_calendar, left_on='date_for_merge', right_on='date_for_merge', how='left')
+    
+    df_final['is_holiday'] = (df_final['day_type'] == 'non-working holiday').astype(int)
+    df_final['is_working_weekend'] = (df_final['day_type'] == 'working weekend').astype(int)
+    df_final['is_regular_weekend'] = (df_final['day_type'] == 'weekend').astype(int)
+    df_final['is_working_day'] = (df_final['day_type'] == 'working day').astype(int)
+    df_final['is_weekend_or_holiday'] = (
+        (df_final['day_type'] == 'weekend') | 
+        (df_final['day_type'] == 'non-working holiday')
+    ).astype(int)
+    
+    df_final = df_final.sort_values('datetime')
+    df_final = create_lag_features(df_final)
+    df_final = create_rolling_features(df_final)
+    df_final = create_ewm_features(df_final)
+    
+    initial_size = len(df_final)
+    df_final = df_final.dropna()
+    final_size = len(df_final)
+    print(f"Удалено строк с пропусками: {initial_size - final_size}")
+    
+    columns_to_drop = ['date_for_merge_x', 'date_for_merge_y', 'T']
+    df_final = df_final.drop(columns=[col for col in columns_to_drop if col in df_final.columns])
+    
+    df_final.to_csv(OUTPUT_FILE, index=False)
+    print(f"=== ПРЕДВАРИТЕЛЬНАЯ ПРЕДОБРАБОТКА ЗАВЕРШЕНА ===")
+    print(f"Промежуточный датасет сохранен в {OUTPUT_FILE}")
+    print(f"Размер: {len(df_final)} строк, {len(df_final.columns)} колонок")
+    
+    # Затем создаем финальные датасеты
+    df_train, df_full = create_final_dataset()
+    
+    print("=== ПОЛНАЯ ПРЕДОБРАБОТКА ЗАВЕРШЕНА ===")
+
+if __name__ == "__main__":
+    main()
