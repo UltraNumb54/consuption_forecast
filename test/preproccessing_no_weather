@@ -1,0 +1,88 @@
+import pandas as pd
+import numpy as np
+from datetime import datetime
+import warnings
+warnings.filterwarnings('ignore')
+
+# === КОНСТАНТЫ ===
+CONSUMPTION_FILE = 'consumption_data.csv'  # date; hour; consumption; week_day; temperature; temperature_forecast
+CALENDAR_FILE = 'russian_production_calendar_2017_2025.csv'
+OUTPUT_FILE = 'enhanced_filtered_no_weather.csv'
+
+def load_and_merge_data():
+    """Загрузка и объединение данных (без погоды)"""
+    # Загрузка потребления
+    df = pd.read_csv(CONSUMPTION_FILE, sep=';', encoding='utf-8')
+    df['datetime'] = pd.to_datetime(df['date']) + pd.to_timedelta(df['hour'], unit='h')
+    df = df.sort_values('datetime').reset_index(drop=True)
+
+    # Загрузка календаря
+    calendar = pd.read_csv(CALENDAR_FILE)
+    calendar['date'] = pd.to_datetime(calendar['date']).dt.date
+    df['date_only'] = df['datetime'].dt.date
+    df = df.merge(calendar, left_on='date_only', right_on='date', how='left')
+    df = df.drop(columns=['date_only', 'date'])
+
+    # Обработка пропусков
+    df['temperature'] = df['temperature'].fillna(method='ffill').fillna(method='bfill')
+    df['consumption'] = df['consumption'].str.replace(',', '.').astype(float)
+
+    # Типы дней
+    df['is_holiday'] = (df['day_type'] == 'non-working holiday').astype(int)
+    df['is_working_weekend'] = (df['day_type'] == 'working weekend').astype(int)
+    df['is_regular_weekend'] = (df['day_type'] == 'weekend').astype(int)
+    df['is_working_day'] = (df['day_type'] == 'working day').astype(int)
+    df['is_weekend_or_holiday'] = df[['is_holiday', 'is_regular_weekend']].max(axis=1)
+
+    # Оставляем только нужные колонки
+    df = df[['datetime', 'consumption', 'temperature', 'is_holiday', 'is_working_weekend', 
+             'is_regular_weekend', 'is_working_day', 'is_weekend_or_holiday']].copy()
+
+    df['year'] = df['datetime'].dt.year
+    df = df.dropna()
+    return df
+
+def create_features(df):
+    """Создание признаков"""
+    df = df.copy()
+    df['hour'] = df['datetime'].dt.hour
+    df['hour_sin'] = np.sin(2 * np.pi * df['hour'] / 24)
+    df['hour_cos'] = np.cos(2 * np.pi * df['hour'] / 24)
+    df['dayofweek'] = df['datetime'].dt.dayofweek
+    df['month'] = df['datetime'].dt.month
+    df['week_of_year'] = df['datetime'].dt.isocalendar().week
+
+    season = df['month'] % 12 // 3 + 1
+    df['is_winter'] = (season == 1).astype(int)
+    df['is_spring'] = (season == 2).astype(int)
+    df['is_summer'] = (season == 3).astype(int)
+    df['is_autumn'] = (season == 4).astype(int)
+    df['is_weekend'] = df['dayofweek'].isin([5, 6]).astype(int)
+
+    # Лаги
+    lag_hours = [1, 2, 3, 24, 48, 72]
+    for lag in lag_hours:
+        df[f'consumption_lag_{lag}'] = df['consumption'].shift(lag)
+
+    # Скользящие
+    windows = [3, 6, 12, 24, 720]
+    for w in windows:
+        df[f'consumption_rolling_mean_{w}'] = df['consumption'].rolling(w).mean()
+        df[f'consumption_rolling_std_{w}'] = df['consumption'].rolling(w).std()
+
+    # EWM
+    spans = [3, 6, 12, 24]
+    for s in spans:
+        df[f'consumption_ewm_mean_{s}'] = df['consumption'].ewm(span=s).mean()
+
+    return df
+
+def main():
+    df = load_and_merge_data()
+    df = create_features(df)
+    df = df.dropna()
+    df.to_csv(OUTPUT_FILE, index=False)
+    print(f"Данные без погоды сохранены в {OUTPUT_FILE}")
+
+if __name__ == "__main__":
+    main()
