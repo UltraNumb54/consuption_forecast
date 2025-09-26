@@ -1,294 +1,126 @@
+# corrected_simulation_test_2025.py
 import pandas as pd
 import numpy as np
 from catboost import CatBoostRegressor
 from sklearn.metrics import mean_absolute_error, mean_absolute_percentage_error
 from datetime import datetime, timedelta
 import warnings
-import matplotlib.pyplot as plt
-import seaborn as sns
-
 warnings.filterwarnings('ignore')
 
 # === КОНСТАНТЫ ===
 MODEL_PATH = 'enhanced_energy_model.cbm'
-CONSUMPTION_FILE = 'consumption_data.csv'
-WEATHER_FILE = 'weather_data.csv'
-CALENDAR_FILE = 'russian_production_calendar_2017_2025.csv'
+PROCESSED_TRAINING_FILE = 'enhanced_filtered_training_data.csv'  # Используем предобработанные данные!
 
-SIM_START = datetime(2025, 1, 1)
-SIM_END = datetime(2025, 12, 31)
-
-# === ЗАГРУЗКА СЫРЫХ ДАННЫХ ===
-def load_raw_data():
-    print("Загрузка сырых данных...")
-    # 1. Потребление
-    df_cons = pd.read_csv(CONSUMPTION_FILE, sep=';')
-    df_cons['datetime'] = pd.to_datetime(df_cons['date']) + pd.to_timedelta(df_cons['hour'], unit='h')
-    # Сохраняем и потребление, и температуру
-    df_cons = df_cons[['datetime', 'consumption', 'temperature']].dropna()
-    df_cons.set_index('datetime', inplace=True)
-    df_cons.sort_index(inplace=True)
-
-    # 2. Погода (влажность, ветер)
-    with open(WEATHER_FILE, 'r', encoding='utf-8') as f:
-        lines = f.readlines()
-    header_line = None
-    for i, line in enumerate(lines):
-        if line.strip().startswith('"Местное время'):
-            data_start = i + 1
-            break
-    df_weather = pd.read_csv(WEATHER_FILE, sep=';', skiprows=data_start, on_bad_lines='skip', encoding='utf-8')
-    if len(df_weather.columns) >= 13:
-        df_weather = df_weather.iloc[:, :13]
-        df_weather.columns = ['datetime', 'T', 'P0', 'P', 'U', 'DD', 'Ff', 'ff10', 'WW', 'WW2', 'clouds', 'VV', 'Td']
-    else:
-        # fallback
-        pass
-    df_weather['datetime'] = pd.to_datetime(df_weather['datetime'], dayfirst=True)
-    df_weather = df_weather[['datetime', 'U', 'Ff']].rename(columns={'U': 'humidity', 'Ff': 'wind_speed'})
-    df_weather.set_index('datetime', inplace=True)
-    df_weather = df_weather.resample('H').mean().interpolate(method='time')
-
-    # 3. Календарь
-    df_cal = pd.read_csv(CALENDAR_FILE)
-    df_cal['date'] = pd.to_datetime(df_cal['date']).dt.date
-    df_cal.set_index('date', inplace=True)
-
-    print(f"Потребление: {df_cons.index.min()} – {df_cons.index.max()}")
-    print(f"Погода: {df_weather.index.min()} – {df_weather.index.max()}")
-    return df_cons, df_weather, df_cal
-
-
-# === ФУНКЦИЯ СОЗДАНИЯ ПРИЗНАКОВ НА ЛЕТУ (ИСПРАВЛЕНА) ===
-def build_features_for_datetime(target_dt, hist_pred_cons, df_weather, df_cal, df_cons_original):
-    """
-    Создаёт признаки для одного часа target_dt.
-    hist_pred_cons: pd.Series с индексом datetime и значением consumption (реальные до SIM_START, предсказанные далее)
-    df_cons_original: pd.DataFrame с индексом datetime и колонками ['consumption', 'temperature'] (реальные данные)
-    """
-    features = {}
-
-    # Временные признаки
-    features['hour'] = target_dt.hour
-    features['hour_sin'] = np.sin(2 * np.pi * target_dt.hour / 24)
-    features['hour_cos'] = np.cos(2 * np.pi * target_dt.hour / 24)
-    features['dayofweek'] = target_dt.weekday()
-    features['month'] = target_dt.month
-    features['week_of_year'] = target_dt.isocalendar()[1]
-    features['is_winter'] = int(target_dt.month in [12, 1, 2])
-    features['is_spring'] = int(target_dt.month in [3, 4, 5])
-    features['is_summer'] = int(target_dt.month in [6, 7, 8])
-    features['is_autumn'] = int(target_dt.month in [9, 10, 11])
-    features['is_weekend'] = int(features['dayofweek'] in [5, 6])
-
-    # Календарь
-    target_date = target_dt.date()
-    day_type = df_cal.loc[target_date, 'day_type'] if target_date in df_cal.index else 'working day'
-    features['is_holiday'] = int(day_type == 'non-working holiday')
-    features['is_working_weekend'] = int(day_type == 'working weekend')
-    features['is_regular_weekend'] = int(day_type == 'weekend')
-    features['is_working_day'] = int(day_type == 'working day')
-    features['is_weekend_or_holiday'] = int(day_type in ['weekend', 'non-working holiday'])
-
-    # Погода (берём ближайшее значение, если нет точного)
-    weather_val = None
-    if target_dt in df_weather.index:
-        weather_val = df_weather.loc[target_dt]
-    else:
-        past_w = df_weather[df_weather.index <= target_dt]
-        if not past_w.empty:
-            weather_val = past_w.iloc[-1]
-    if weather_val is not None:
-        features['humidity'] = weather_val.get('humidity', np.nan)
-        features['wind_speed'] = weather_val.get('wind_speed', np.nan)
-    else:
-        features['humidity'] = np.nan
-        features['wind_speed'] = np.nan
-
-    # Температура — из ИСХОДНОГО датасета ПОТРЕБЛЕНИЯ (df_cons_original), а не из hist_pred_cons!
-    temp_val = np.nan
-    if target_dt in df_cons_original.index and 'temperature' in df_cons_original.columns:
-        temp_val = df_cons_original.loc[target_dt, 'temperature']
-    else:
-        # Ищем ближайшую прошлую температуру в df_cons_original
-        past_temp = df_cons_original[(df_cons_original.index <= target_dt) & (df_cons_original['temperature'].notna())]
-        if not past_temp.empty:
-             temp_val = past_temp['temperature'].iloc[-1]
-    features['temperature'] = temp_val
-
-    # === ЛАГИ И СКОЛЬЗЯЩИЕ — ТОЛЬКО ИЗ ИСТОРИИ ПРЕДСКАЗАНИЙ hist_pred_cons ===
-    hist_for_features = hist_pred_cons[hist_pred_cons.index < target_dt]
-    if hist_for_features.empty:
-        # Заполняем NaN
-        lag_hours = [1, 2, 3, 24, 48, 72, 120, 168]
-        windows = [3, 6, 12, 24, 720]
-        spans = [3, 6, 12, 24]
-        for lag in lag_hours:
-            features[f'consumption_lag_{lag}'] = np.nan
-        for w in windows:
-            features[f'consumption_rolling_mean_{w}'] = np.nan
-            features[f'consumption_rolling_std_{w}'] = np.nan
-        for s in spans:
-            features[f'consumption_ewm_mean_{s}'] = np.nan
-    else:
-        # Лаги
-        lag_hours = [1, 2, 3, 24, 48, 72, 120, 168]
-        for lag in lag_hours:
-            lag_time = target_dt - timedelta(hours=lag)
-            if lag_time in hist_for_features.index:
-                features[f'consumption_lag_{lag}'] = hist_for_features.loc[lag_time]
-            else:
-                features[f'consumption_lag_{lag}'] = np.nan
-
-        # Rolling
-        windows = [3, 6, 12, 24, 720]
-        for w in windows:
-            window_start = target_dt - timedelta(hours=w)
-            window_data = hist_for_features[(hist_for_features.index >= window_start)]
-            if len(window_data) > 0:
-                features[f'consumption_rolling_mean_{w}'] = window_data.mean()
-                features[f'consumption_rolling_std_{w}'] = window_data.std()
-            else:
-                features[f'consumption_rolling_mean_{w}'] = np.nan
-                features[f'consumption_rolling_std_{w}'] = np.nan
-
-        # EWM
-        spans = [3, 6, 12, 24]
-        for s in spans:
-            window_start = target_dt - timedelta(hours=s)
-            window_data = hist_for_features[(hist_for_features.index >= window_start)]
-            if len(window_data) > 0:
-                features[f'consumption_ewm_mean_{s}'] = window_data.ewm(span=s).mean().iloc[-1]
-            else:
-                features[f'consumption_ewm_mean_{s}'] = np.nan
-
-    return features
-
-
-# === ОСНОВНАЯ СИМУЛЯЦИЯ (ИСПРАВЛЕНА) ===
-def simulate_2025():
-    df_cons_original, df_weather, df_cal = load_raw_data()
+def corrected_simulation():
+    """Исправленная симуляция, соответствующая процессу обучения"""
+    
+    # Загружаем ПРЕДОБРАБОТАННЫЕ данные (как при обучении)
+    df = pd.read_csv(PROCESSED_TRAINING_FILE)
+    df['datetime'] = pd.to_datetime(df['datetime'])
+    df = df.sort_values('datetime')
+    
+    # Загружаем модель и получаем признаки
     model = CatBoostRegressor()
     model.load_model(MODEL_PATH)
     feature_names = model.feature_names_
-
-    # История начинается с данных до 1 января 2025
-    # hist_cons_before_sim - это Series с consumption ДО SIM_START
-    hist_cons_before_sim = df_cons_original[df_cons_original.index < SIM_START]['consumption']
-    # Для симуляции мы будем расширять эту историю предсказаниями
-    # Инициализируем hist_pred_cons с историей до SIM_START
-    hist_pred_cons = hist_cons_before_sim.copy()
-
-    results_1d = []
-    results_3d = []
-
-    current_day = SIM_START
-    while current_day <= SIM_END:
-        print(f"\nПрогноз на {current_day.strftime('%Y-%m-%d')}...")
-
-        # --- Прогноз на 1 день ---
-        hours_1d = [current_day + timedelta(hours=h) for h in range(24)]
-        X_1d = []
-        for dt in hours_1d:
-            # Передаём hist_pred_cons (история + предыдущие предсказания), df_weather, df_cal, df_cons_original (для температуры)
-            feat = build_features_for_datetime(dt, hist_pred_cons, df_weather, df_cal, df_cons_original)
-            X_1d.append(feat)
-        X_1d = pd.DataFrame(X_1d)
-        X_1d = X_1d.reindex(columns=feature_names, fill_value=np.nan)
-        pred_1d = model.predict(X_1d)
-
-        # Реальность
-        real_1d_series = df_cons_original.loc[hours_1d, 'consumption']
-        if len(real_1d_series) != 24:
-            print("  Пропуск: не хватает реальных данных")
-            current_day += timedelta(days=1)
+    
+    print(f"Модель использует {len(feature_names)} признаков")
+    
+    # Разделяем на тренировочную часть и "будущее" для симуляции
+    split_date = datetime(2024, 12, 1)  # Все что после - симулируем прогноз
+    train_data = df[df['datetime'] < split_date]
+    test_period = df[df['datetime'] >= split_date]
+    
+    results = []
+    
+    # Симулируем прогноз на 3 дня вперед для каждого дня в тестовом периоде
+    for current_date in test_period['datetime'].unique():
+        current_date = pd.to_datetime(current_date)
+        
+        # Данные ДО текущей даты (история)
+        historical_data = df[df['datetime'] < current_date]
+        
+        # Целевые даты для прогноза (следующие 72 часа)
+        forecast_dates = pd.date_range(
+            start=current_date, 
+            periods=72, 
+            freq='H'
+        )
+        
+        # Фильтруем только те даты, которые есть в реальных данных
+        actual_data = test_period[test_period['datetime'].isin(forecast_dates)]
+        
+        if len(actual_data) < 24:  # Минимум 1 день данных для оценки
             continue
-        real_1d = real_1d_series.values # <-- Получаем numpy array
+            
+        # Берем признаки для прогнозируемых дат из ПРЕДОБРАБОТАННЫХ данных
+        # Это имитирует идеальный прогноз признаков (температура, погода и т.д.)
+        X_forecast = actual_data[feature_names]
+        y_actual = actual_data['consumption']
+        
+        # Прогноз
+        y_pred = model.predict(X_forecast)
+        
+        # Оценка для 1 дня и 3 дней
+        for days_ahead in [1, 3]:
+            hours = 24 * days_ahead
+            if len(y_actual) >= hours:
+                y_act_subset = y_actual[:hours]
+                y_pred_subset = y_pred[:hours]
+                
+                mae = mean_absolute_error(y_act_subset, y_pred_subset)
+                mape = mean_absolute_percentage_error(y_act_subset, y_pred_subset) * 100
+                
+                results.append({
+                    'date': current_date,
+                    'days_ahead': days_ahead,
+                    'mae': mae,
+                    'mape': mape,
+                    'data_points': len(y_act_subset)
+                })
+    
+    # Анализ результатов
+    results_df = pd.DataFrame(results)
+    
+    print("\n=== РЕЗУЛЬТАТЫ ИСПРАВЛЕННОЙ СИМУЛЯЦИИ ===")
+    for days in [1, 3]:
+        subset = results_df[results_df['days_ahead'] == days]
+        if len(subset) > 0:
+            print(f"\nПрогноз на {days} день(дней):")
+            print(f"Средний MAE: {subset['mae'].mean():.3f}")
+            print(f"Средний MAPE: {subset['mape'].mean():.2f}%")
+            print(f"Количество прогнозов: {len(subset)}")
+    
+    return results_df
 
-        mae = mean_absolute_error(real_1d, pred_1d)
-        mape = mean_absolute_percentage_error(real_1d, pred_1d) * 100
-        results_1d.append({'date': current_day, 'mae': mae, 'mape': mape})
-
-        # --- Прогноз на 3 дня ---
-        hours_3d = [current_day + timedelta(hours=h) for h in range(72)]
-        X_3d = []
-        for dt in hours_3d:
-            feat = build_features_for_datetime(dt, hist_pred_cons, df_weather, df_cal, df_cons_original)
-            X_3d.append(feat)
-        X_3d = pd.DataFrame(X_3d)
-        X_3d = X_3d.reindex(columns=feature_names, fill_value=np.nan)
-        pred_3d = model.predict(X_3d)
-
-        real_3d_series = df_cons_original.loc[hours_3d, 'consumption']
-        if len(real_3d_series) != 72:
-            print("  Пропуск 3d: не хватает данных")
-        else:
-            real_3d = real_3d_series.values # <-- Получаем numpy array
-            mae3 = mean_absolute_error(real_3d, pred_3d)
-            mape3 = mean_absolute_percentage_error(real_3d, pred_3d) * 100
-            results_3d.append({'date': current_day, 'mae': mae3, 'mape': mape3})
-
-        # --- Обновляем историю предсказаний: добавляем предсказания за current_day ---
-        # Создаём Series с предсказаниями для текущего дня
-        pred_current_day_series = pd.Series(pred_1d, index=hours_1d, name='predicted_consumption')
-        # Объединяем историю с новыми предсказаниями
-        hist_pred_cons = pd.concat([hist_pred_cons, pred_current_day_series])
-
-        current_day += timedelta(days=1)
-
-    # === ВЫВОД И АНАЛИЗ ПО МЕСЯЦАМ ===
-    df1 = pd.DataFrame(results_1d)
-    df1['month'] = df1['date'].dt.month
-    df1['month_name'] = df1['date'].dt.strftime('%b')
-
-    df3 = pd.DataFrame(results_3d)
-    df3['month'] = df3['date'].dt.month
-    df3['month_name'] = df3['date'].dt.strftime('%b')
-
-    print("\n=== РЕЗУЛЬТАТЫ ПО МЕСЯЦАМ (1 день) ===")
-    print(df1.groupby('month_name')[['mae', 'mape']].mean().round(3))
-
-    print("\n=== РЕЗУЛЬТАТЫ ПО МЕСЯЦАМ (3 дня) ===")
-    print(df3.groupby('month_name')[['mae', 'mape']].mean().round(3))
-
-    # === ВИЗУАЛИЗАЦИЯ ===
-    fig, axes = plt.subplots(2, 2, figsize=(15, 12))
-    fig.suptitle('Результаты симуляции 2025', fontsize=16)
-
-    # MAE по месяцам (1 день)
-    sns.barplot(data=df1, x='month_name', y='mae', ax=axes[0, 0], palette='viridis')
-    axes[0, 0].set_title('Средняя MAE (1 день)')
-    axes[0, 0].set_ylabel('MAE')
-    axes[0, 0].tick_params(axis='x', rotation=45)
-
-    # MAPE по месяцам (1 день)
-    sns.barplot(data=df1, x='month_name', y='mape', ax=axes[0, 1], palette='viridis')
-    axes[0, 1].set_title('Средняя MAPE (1 день)')
-    axes[0, 1].set_ylabel('MAPE (%)')
-    axes[0, 1].tick_params(axis='x', rotation=45)
-
-    # MAE по месяцам (3 дня)
-    sns.barplot(data=df3, x='month_name', y='mae', ax=axes[1, 0], palette='plasma')
-    axes[1, 0].set_title('Средняя MAE (3 дня)')
-    axes[1, 0].set_ylabel('MAE')
-    axes[1, 0].tick_params(axis='x', rotation=45)
-
-    # MAPE по месяцам (3 дня)
-    sns.barplot(data=df3, x='month_name', y='mape', ax=axes[1, 1], palette='plasma')
-    axes[1, 1].set_title('Средняя MAPE (3 дня)')
-    axes[1, 1].set_ylabel('MAPE (%)')
-    axes[1, 1].tick_params(axis='x', rotation=45)
-
-    plt.tight_layout(rect=[0, 0, 1, 0.96])
-    plt.savefig('sim_2025_results_by_month.png', dpi=300, bbox_inches='tight')
-    plt.show()
-
-    # === СОХРАНЕНИЕ РЕЗУЛЬТАТОВ ===
-    df1.to_csv('sim_1day_2025.csv', index=False)
-    df3.to_csv('sim_3day_2025.csv', index=False)
-    print("\nРезультаты сохранены в sim_1day_2025.csv и sim_3day_2025.csv.")
-    print("Графики сохранены в sim_2025_results_by_month.png.")
-
+def analyze_discrepancies():
+    """Анализ различий между подходами"""
+    
+    # 1. Сравнение признаков
+    df_processed = pd.read_csv(PROCESSED_TRAINING_FILE)
+    model = CatBoostRegressor()
+    model.load_model(MODEL_PATH)
+    
+    print("=== АНАЛИЗ РАЗЛИЧИЙ ===")
+    print(f"Признаки в обученной модели: {len(model.feature_names_)}")
+    print("Примеры признаков:", model.feature_names_[:10])
+    
+    # 2. Проверка распределения целевой переменной
+    print(f"\nРаспределение consumption в обучающих данных:")
+    print(df_processed['consumption'].describe())
+    
+    # 3. Проверка на наличие пропусков
+    print(f"\nПропуски в обучающих данных:")
+    print(df_processed[model.feature_names_].isnull().sum().sum())
 
 if __name__ == "__main__":
-    simulate_2025()
+    # Анализ различий
+    analyze_discrepancies()
+    
+    # Запуск исправленной симуляции
+    print("\n" + "="*50)
+    results = corrected_simulation()
+    
+    # Сохранение результатов
+    results.to_csv('corrected_simulation_results.csv', index=False)
+    print("\nРезультаты сохранены в corrected_simulation_results.csv")
