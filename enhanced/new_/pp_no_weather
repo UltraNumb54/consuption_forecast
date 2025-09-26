@@ -1,1 +1,422 @@
+1. optimized_preprocessing_no_weather.py
+python
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
 
+# === КОНСТАНТЫ ===
+CONSUMPTION_FILE = 'consumption_data.csv'
+CALENDAR_FILE = 'russian_production_calendar_2017_2025.csv'
+OUTPUT_FILE = 'optimized_processed_energy_data_no_weather.csv'
+
+def preprocess_consumption_data():
+    """Предобработка данных потребления с использованием только температуры из consumption"""
+    print("Загрузка данных по потреблению...")
+    try:
+        df_consumption = pd.read_csv(CONSUMPTION_FILE, sep=';', parse_dates=['date'])
+    except FileNotFoundError:
+        print(f"Ошибка: Файл {CONSUMPTION_FILE} не найден!")
+        return None
+
+    # Основные преобразования
+    df_consumption['datetime'] = pd.to_datetime(df_consumption['date']) + pd.to_timedelta(df_consumption['hour'], unit='h')
+    df_consumption = df_consumption.dropna(subset=['consumption', 'temperature'])
+    
+    # Удаляем ненужные колонки
+    columns_to_drop = ['temperature_forecast', 'week_day']
+    df_consumption = df_consumption.drop(columns=[col for col in columns_to_drop if col in df_consumption.columns])
+    
+    # Базовые временные признаки
+    df_consumption['hour'] = df_consumption['datetime'].dt.hour
+    df_consumption['dayofweek'] = df_consumption['datetime'].dt.dayofweek
+    df_consumption['month'] = df_consumption['datetime'].dt.month
+    df_consumption['year'] = df_consumption['datetime'].dt.year
+    df_consumption['dayofyear'] = df_consumption['datetime'].dt.dayofyear
+    
+    # Циклические признаки для часа
+    df_consumption['hour_sin'] = np.sin(2 * np.pi * df_consumption['hour'] / 24)
+    df_consumption['hour_cos'] = np.cos(2 * np.pi * df_consumption['hour'] / 24)
+    
+    # Циклические признаки для месяца
+    df_consumption['month_sin'] = np.sin(2 * np.pi * df_consumption['month'] / 12)
+    df_consumption['month_cos'] = np.cos(2 * np.pi * df_consumption['month'] / 12)
+    
+    # Циклические признаки для дня года
+    df_consumption['dayofyear_sin'] = np.sin(2 * np.pi * df_consumption['dayofyear'] / 365)
+    df_consumption['dayofyear_cos'] = np.cos(2 * np.pi * df_consumption['dayofyear'] / 365)
+    
+    # Сезон (1-4)
+    df_consumption['season'] = df_consumption['month'] % 12 // 3 + 1
+    
+    # Температурные признаки (только из consumption)
+    df_consumption['temp_squared'] = df_consumption['temperature'] ** 2
+    df_consumption['temp_cubed'] = df_consumption['temperature'] ** 3
+    
+    # Температурные зоны (очень холодно, холодно, комфортно, тепло, жарко)
+    df_consumption['temp_zone'] = pd.cut(df_consumption['temperature'], 
+                                       bins=[-40, -10, 0, 10, 20, 30, 40],
+                                       labels=['very_cold', 'cold', 'cool', 'comfort', 'warm', 'hot'])
+    
+    print(f"Данные по потреблению обработаны. Размер: {len(df_consumption)}")
+    return df_consumption
+
+def load_calendar():
+    """Загрузка календаря"""
+    print("Загрузка производственного календаря...")
+    try:
+        df_calendar = pd.read_csv(CALENDAR_FILE)
+        df_calendar['date'] = pd.to_datetime(df_calendar['date']).dt.date
+        return df_calendar
+    except FileNotFoundError:
+        print(f"Ошибка: Файл {CALENDAR_FILE} не найден!")
+        return None
+
+def create_temporal_features(df):
+    """Создание временных признаков"""
+    print("Создание временных признаков...")
+    
+    # Сортируем по времени
+    df = df.sort_values('datetime')
+    
+    # Лаги потребления
+    important_lags = [1, 2, 3, 4, 5, 6, 24, 48, 72, 168]  # Добавили больше лагов
+    for lag in important_lags:
+        df[f'consumption_lag_{lag}'] = df['consumption'].shift(lag)
+    
+    # Лаги температуры
+    temp_lags = [1, 24, 48]
+    for lag in temp_lags:
+        df[f'temperature_lag_{lag}'] = df['temperature'].shift(lag)
+    
+    # Скользящие окна потребления
+    windows = [3, 6, 12, 24, 48, 168]  # Добавили больше окон
+    for window in windows:
+        df[f'consumption_rolling_mean_{window}'] = df['consumption'].rolling(window=window, min_periods=1).mean()
+        df[f'consumption_rolling_std_{window}'] = df['consumption'].rolling(window=window, min_periods=1).std()
+    
+    # Скользящие окна температуры
+    temp_windows = [24, 168]
+    for window in temp_windows:
+        df[f'temperature_rolling_mean_{window}'] = df['temperature'].rolling(window=window, min_periods=1).mean()
+    
+    # Экспоненциальное сглаживание
+    df['consumption_ewm_24'] = df['consumption'].ewm(span=24).mean()
+    df['consumption_ewm_168'] = df['consumption'].ewm(span=168).mean()
+    
+    # Разности (производные)
+    df['consumption_diff_1'] = df['consumption'].diff(1)
+    df['consumption_diff_24'] = df['consumption'].diff(24)
+    
+    # Суточные паттерны (среднее потребление по часу дня)
+    hourly_patterns = df.groupby('hour')['consumption'].mean().to_dict()
+    df['hourly_pattern'] = df['hour'].map(hourly_patterns)
+    
+    # Недельные паттерны (среднее потребление по дню недели)
+    weekday_patterns = df.groupby('dayofweek')['consumption'].mean().to_dict()
+    df['weekday_pattern'] = df['dayofweek'].map(weekday_patterns)
+    
+    return df
+
+def main():
+    """Основная функция предобработки без погодных данных"""
+    print("=== ПРЕДОБРАБОТКА ДАННЫХ БЕЗ ПОГОДНЫХ ПРИЗНАКОВ ===")
+
+    # Загрузка данных
+    df_consumption = preprocess_consumption_data()
+    df_calendar = load_calendar()
+    
+    if df_consumption is None or df_calendar is None:
+        return
+
+    # Добавляем календарь
+    df_consumption['date_only'] = df_consumption['datetime'].dt.date
+    df_calendar['date_for_merge'] = pd.to_datetime(df_calendar['date']).dt.date
+    df_final = pd.merge(df_consumption, df_calendar, left_on='date_only', right_on='date_for_merge', how='left')
+
+    # Календарные признаки
+    df_final['is_weekend'] = (df_final['day_type'] == 'weekend').astype(int)
+    df_final['is_holiday'] = (df_final['day_type'] == 'non-working holiday').astype(int)
+    df_final['is_working_day'] = (df_final['day_type'] == 'working day').astype(int)
+    df_final['is_working_weekend'] = (df_final['day_type'] == 'working weekend').astype(int)
+
+    # Временные признаки
+    df_final = create_temporal_features(df_final)
+
+    # Удаляем пропуски
+    initial_size = len(df_final)
+    df_final = df_final.dropna()
+    final_size = len(df_final)
+    print(f"Удалено строк с пропусками: {initial_size - final_size}")
+
+    # Удаляем служебные колонки
+    columns_to_drop = ['date_only', 'date_for_merge', 'day_type', 'date']
+    df_final = df_final.drop(columns=[col for col in columns_to_drop if col in df_final.columns])
+
+    # Сохраняем
+    df_final.to_csv(OUTPUT_FILE, index=False)
+    print(f"=== ПРЕДОБРАБОТКА БЕЗ ПОГОДНЫХ ДАННЫХ ЗАВЕРШЕНА ===")
+    print(f"Финальный датасет: {len(df_final)} строк, {len(df_final.columns)} колонок")
+    
+    # Выводим финальный список признаков
+    print("\nФИНАЛЬНЫЕ ПРИЗНАКИ (без внешней погоды):")
+    features = [col for col in df_final.columns if col not in ['datetime', 'consumption']]
+    for i, col in enumerate(sorted(features)):
+        print(f"{i+1:2d}. {col}")
+
+if __name__ == "__main__":
+    main()
+2. optimized_training_no_weather.py
+python
+import pandas as pd
+import numpy as np
+from catboost import CatBoostRegressor
+from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
+from sklearn.metrics import make_scorer, mean_absolute_percentage_error, mean_absolute_error
+import warnings
+warnings.filterwarnings('ignore')
+
+# === КОНСТАНТЫ ===
+OPTIMIZED_DATA_FILE = 'optimized_processed_energy_data_no_weather.csv'
+MODEL_PATH = 'optimized_energy_model_no_weather.cbm'
+
+def mape_scorer(y_true, y_pred):
+    """Кастомный scorer для MAPE"""
+    return -mean_absolute_percentage_error(y_true, y_pred)
+
+def get_optimized_features_no_weather(df):
+    """Возвращает список признаков БЕЗ внешних погодных данных"""
+    
+    # ОСНОВНЫЕ ПРИЗНАКИ (только температура из consumption)
+    core_features = [
+        # Временные паттерны потребления
+        'consumption_lag_1', 'consumption_lag_2', 'consumption_lag_3', 
+        'consumption_lag_24', 'consumption_lag_48', 'consumption_lag_168',
+        'consumption_rolling_mean_24', 'consumption_rolling_mean_168',
+        'consumption_ewm_24', 'consumption_ewm_168',
+        'consumption_diff_1', 'consumption_diff_24',
+        
+        # Паттерны по времени
+        'hourly_pattern', 'weekday_pattern',
+        
+        # Температурные признаки (только из consumption)
+        'temperature', 'temp_squared', 'temp_cubed',
+        'temperature_lag_1', 'temperature_lag_24',
+        'temperature_rolling_mean_24', 'temperature_rolling_mean_168',
+        
+        # Циклические признаки времени
+        'hour_sin', 'hour_cos', 'month_sin', 'month_cos',
+        'dayofyear_sin', 'dayofyear_cos',
+        
+        # Календарные признаки
+        'is_weekend', 'is_holiday', 'is_working_day', 'is_working_weekend',
+        
+        # Временные метрики
+        'year', 'season', 'hour', 'month', 'dayofweek', 'dayofyear',
+        'temp_zone'
+    ]
+    
+    # Фильтруем только существующие признаки
+    existing_features = [feature for feature in core_features if feature in df.columns]
+    
+    print("ПРИЗНАКИ БЕЗ ВНЕШНЕЙ ПОГОДЫ:")
+    for i, feature in enumerate(existing_features):
+        print(f"{i+1:2d}. {feature}")
+    
+    return existing_features
+
+def train_optimized_model_no_weather():
+    """Обучение модели БЕЗ внешних погодных данных"""
+    print("=== ОБУЧЕНИЕ МОДЕЛИ БЕЗ ВНЕШНИХ ПОГОДНЫХ ДАННЫХ ===")
+    
+    # Загрузка данных
+    df = pd.read_csv(OPTIMIZED_DATA_FILE)
+    df['datetime'] = pd.to_datetime(df['datetime'])
+    df = df.sort_values('datetime')
+
+    print(f"Данные: {len(df)} записей")
+    print(f"Период: {df['datetime'].min()} - {df['datetime'].max()}")
+    
+    # Получаем признаки без внешней погоды
+    feature_columns = get_optimized_features_no_weather(df)
+    
+    # Целевая переменная
+    target_column = 'consumption'
+    
+    # Формируем X и y
+    X = df[feature_columns]
+    y = df[target_column]
+    
+    print(f"X shape: {X.shape}, y shape: {y.shape}")
+
+    # КАТЕГОРИАЛЬНЫЕ ПРИЗНАКИ
+    categorical_features = [
+        'season', 'is_weekend', 'is_holiday', 'is_working_day', 'is_working_weekend',
+        'year', 'month', 'dayofweek', 'hour', 'temp_zone'
+    ]
+    categorical_features = [col for col in categorical_features if col in feature_columns]
+    
+    print(f"Категориальные признаки: {categorical_features}")
+
+    # Кросс-валидация для временных рядов
+    tscv = TimeSeriesSplit(n_splits=3)
+
+    # Оптимизированная сетка гиперпараметров
+    param_grid = {
+        'iterations': [300, 500],
+        'learning_rate': [0.05, 0.1],
+        'depth': [6, 8],
+        'l2_leaf_reg': [3, 5],
+        'random_seed': [42]
+    }
+
+    # Модель
+    model = CatBoostRegressor(
+        loss_function='MAPE',
+        cat_features=categorical_features,
+        verbose=False
+    )
+
+    # Поиск параметров
+    print("\n🔍 Подбор гиперпараметров...")
+    grid_search = GridSearchCV(
+        estimator=model,
+        param_grid=param_grid,
+        scoring=make_scorer(mape_scorer, greater_is_better=False),
+        cv=tscv,
+        n_jobs=-1,
+        verbose=1
+    )
+
+    grid_search.fit(X, y)
+
+    print(f"\n🏆 Лучшие параметры: {grid_search.best_params_}")
+    print(f"📈 Лучший MAPE: {-grid_search.best_score_:.4f}")
+
+    # Финальное обучение с early stopping
+    split_idx = int(len(X) * 0.8)
+    X_train, X_val = X.iloc[:split_idx], X.iloc[split_idx:]
+    y_train, y_val = y.iloc[:split_idx], y.iloc[split_idx:]
+
+    print("\n🚀 Финальное обучение...")
+    best_model = CatBoostRegressor(
+        **grid_search.best_params_,
+        loss_function='MAPE',
+        eval_metric='MAPE',
+        cat_features=categorical_features,
+        early_stopping_rounds=20,
+        use_best_model=True,
+        verbose=50
+    )
+
+    best_model.fit(X_train, y_train, eval_set=(X_val, y_val))
+
+    # Оценка
+    y_pred = best_model.predict(X)
+    mae = mean_absolute_error(y, y_pred)
+    mape = mean_absolute_percentage_error(y, y_pred) * 100
+    
+    print(f"\n📊 Результаты на всех данных:")
+    print(f"   MAE: {mae:.3f}")
+    print(f"   MAPE: {mape:.2f}%")
+
+    # Важность признаков
+    print(f"\n=== ВАЖНОСТЬ ПРИЗНАКОВ (без внешней погоды) ===")
+    feature_importance = pd.DataFrame({
+        'feature': X.columns,
+        'importance': best_model.get_feature_importance()
+    }).sort_values('importance', ascending=False)
+    
+    for i, row in feature_importance.iterrows():
+        print(f"{i+1:2d}. {row['feature']:<30} : {row['importance']:>8.2f}")
+
+    # Сохраняем модель
+    best_model.save_model(MODEL_PATH)
+    print(f"\n✅ Модель сохранена в {MODEL_PATH}")
+
+    return best_model, feature_columns
+
+if __name__ == "__main__":
+    model, features = train_optimized_model_no_weather()
+    print("\n🎉 Обучение завершено успешно!")
+3. optimized_test_no_weather.py
+python
+import pandas as pd
+import numpy as np
+from catboost import CatBoostRegressor
+import matplotlib.pyplot as plt
+from sklearn.metrics import mean_absolute_error, mean_absolute_percentage_error
+from datetime import datetime, timedelta
+
+# === КОНСТАНТЫ ===
+MODEL_PATH = 'optimized_energy_model_no_weather.cbm'
+OPTIMIZED_DATA_FILE = 'optimized_processed_energy_data_no_weather.csv'
+TEST_START_DATE = '2025-09-01'
+TEST_DAYS = 3
+
+def test_optimized_model_no_weather():
+    """Тестирование модели БЕЗ внешних погодных данных"""
+    print("=== ТЕСТИРОВАНИЕ МОДЕЛИ БЕЗ ВНЕШНИХ ПОГОДНЫХ ДАННЫХ ===")
+    
+    # Загрузка модели
+    model = CatBoostRegressor()
+    model.load_model(MODEL_PATH)
+    feature_columns = model.feature_names_
+    print(f"Модель использует {len(feature_columns)} признаков")
+
+    # Загрузка данных
+    df = pd.read_csv(OPTIMIZED_DATA_FILE)
+    df['datetime'] = pd.to_datetime(df['datetime'])
+    print(f"Данные: {len(df)} записей")
+
+    # Тестовый период
+    test_start = datetime.strptime(TEST_START_DATE, '%Y-%m-%d')
+    test_end = test_start + timedelta(days=TEST_DAYS)
+    test_data = df[(df['datetime'] >= test_start) & (df['datetime'] < test_end)]
+    
+    if len(test_data) == 0:
+        print("Ошибка: Нет данных для теста!")
+        return
+
+    # Предсказания
+    X_test = test_data[feature_columns]
+    y_test = test_data['consumption']
+    predictions = model.predict(X_test)
+
+    # Оценка
+    mae = mean_absolute_error(y_test, predictions)
+    mape = mean_absolute_percentage_error(y_test, predictions) * 100
+    mean_actual = np.mean(y_test)
+    
+    print(f"\n📊 РЕЗУЛЬТАТЫ ТЕСТА (без внешней погоды):")
+    print(f"Период: {test_start} - {test_end}")
+    print(f"Количество предсказаний: {len(predictions)}")
+    print(f"MAE: {mae:.3f}")
+    print(f"MAPE: {mape:.2f}%")
+    print(f"Среднее потребление: {mean_actual:.1f}")
+    print(f"Точность (±2.5%): {'ДА' if mape < 2.5 else 'НЕТ'}")
+
+    # Визуализация
+    plt.figure(figsize=(12, 8))
+    plt.plot(test_data['datetime'], y_test, 'b-', label='Реальное', linewidth=2)
+    plt.plot(test_data['datetime'], predictions, 'r--', label='Предсказанное', linewidth=2)
+    plt.title(f'Прогноз потребления на {TEST_DAYS} дня (без внешних погодных данных)')
+    plt.ylabel('Потребление (МВт)')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.savefig('optimized_test_results_no_weather.png', dpi=300, bbox_inches='tight')
+    plt.show()
+
+    # Сохранение результатов
+    results_df = pd.DataFrame({
+        'datetime': test_data['datetime'],
+        'actual': y_test.values,
+        'predicted': predictions,
+        'error': np.abs(y_test.values - predictions)
+    })
+    results_df.to_csv('optimized_test_results_no_weather.csv', index=False)
+    print("Результаты сохранены в optimized_test_results_no_weather.csv")
+
+if __name__ == "__main__":
+    test_optimized_model_no_weather()
