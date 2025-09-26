@@ -97,16 +97,16 @@ def build_features_for_datetime(target_dt, hist_cons, df_weather, df_cal):
         features['humidity'] = np.nan
         features['wind_speed'] = np.nan
 
-    # Температура — из потребления (как в обучении!)
-    if target_dt in hist_cons.index:
-        features['temperature'] = hist_cons.loc[target_dt]
+    # Температура — из consumption_data.csv (НЕ из consumption!)
+    temp_val = np.nan
+    if target_dt in df_cons.index:
+        temp_val = df_cons.loc[target_dt, 'temperature']
     else:
         # Ищем ближайшую прошлую температуру
-        past_t = hist_cons[hist_cons.index <= target_dt]
+        past_t = df_cons[df_cons.index <= target_dt]
         if not past_t.empty:
-            features['temperature'] = past_t.iloc[-1]  # Это consumption, но в исходнике temperature там же!
-        else:
-            features['temperature'] = np.nan
+            temp_val = past_t['temperature'].iloc[-1]
+    features['temperature'] = temp_val
 
     # === ЛАГИ И СКОЛЬЗЯЩИЕ — ТОЛЬКО ИЗ ИСТОРИИ ДО target_dt ===
     hist_for_features = hist_cons[hist_cons.index < target_dt]
@@ -128,7 +128,7 @@ def build_features_for_datetime(target_dt, hist_cons, df_weather, df_cal):
         for lag in lag_hours:
             lag_time = target_dt - timedelta(hours=lag)
             if lag_time in hist_for_features.index:
-                features[f'consumption_lag_{lag}'] = hist_for_features.loc[lag_time]
+                features[f'consumption_lag_{lag}'] = hist_for_features.loc[lag_time, 'consumption']
             else:
                 features[f'consumption_lag_{lag}'] = np.nan
 
@@ -138,8 +138,8 @@ def build_features_for_datetime(target_dt, hist_cons, df_weather, df_cal):
             window_start = target_dt - timedelta(hours=w)
             window_data = hist_for_features[(hist_for_features.index >= window_start)]
             if len(window_data) > 0:
-                features[f'consumption_rolling_mean_{w}'] = window_data.mean()
-                features[f'consumption_rolling_std_{w}'] = window_data.std()
+                features[f'consumption_rolling_mean_{w}'] = window_data['consumption'].mean()
+                features[f'consumption_rolling_std_{w}'] = window_data['consumption'].std()
             else:
                 features[f'consumption_rolling_mean_{w}'] = np.nan
                 features[f'consumption_rolling_std_{w}'] = np.nan
@@ -150,9 +150,18 @@ def build_features_for_datetime(target_dt, hist_cons, df_weather, df_cal):
             window_start = target_dt - timedelta(hours=s)
             window_data = hist_for_features[(hist_for_features.index >= window_start)]
             if len(window_data) > 0:
-                features[f'consumption_ewm_mean_{s}'] = window_data.ewm(span=s).mean().iloc[-1]
+                features[f'consumption_ewm_mean_{s}'] = window_data['consumption'].ewm(span=s).mean().iloc[-1]
             else:
                 features[f'consumption_ewm_mean_{s}'] = np.nan
+
+    # --- ДЕБАГ ---
+    if target_dt.hour == 0 and target_dt.day == 1 and target_dt.month == 1:
+        print(f"[DEBUG] {target_dt}:")
+        print(f"  consumption_lag_24 = {features.get('consumption_lag_24')}")
+        print(f"  consumption_rolling_mean_24 = {features.get('consumption_rolling_mean_24')}")
+        print(f"  temperature = {features.get('temperature')}")
+        print(f"  humidity = {features.get('humidity')}")
+        print("  ---")
 
     return features
 
@@ -162,9 +171,10 @@ def simulate_2025():
     model = CatBoostRegressor()
     model.load_model(MODEL_PATH)
     feature_names = model.feature_names_
+    print(f"Модель обучалась на {len(feature_names)} признаках: {feature_names[:5]}...")
 
     # История начинается с данных до 1 января 2025
-    hist_cons = df_cons[df_cons.index < SIM_START]['consumption']  # Только consumption!
+    hist_cons = df_cons[df_cons.index < SIM_START]  # DataFrame, а не Series!
 
     results_1d = []
     results_3d = []
@@ -213,7 +223,7 @@ def simulate_2025():
             results_3d.append({'date': current_day, 'mae': mae3, 'mape': mape3})
 
         # --- Обновляем историю: добавляем реальные данные за current_day ---
-        new_data = df_cons[(df_cons.index >= current_day) & (df_cons.index < current_day + timedelta(days=1))]['consumption']
+        new_data = df_cons[(df_cons.index >= current_day) & (df_cons.index < current_day + timedelta(days=1))]
         if not new_data.empty:
             hist_cons = pd.concat([hist_cons, new_data])
 
