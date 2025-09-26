@@ -1,3 +1,93 @@
+////// train
+# ЗАМЕНИТЕ весь блок формирования признаков в model_training.py на этот:
+
+def train_model_with_optimization():
+    """Обучение модели с подбором гиперпараметров - ИСПРАВЛЕННАЯ ВЕРСИЯ"""
+    print("=== ОБУЧЕНИЕ УЛУЧШЕННОЙ МОДЕЛИ С ПОДБОРОМ ГИПЕРПАРАМЕТРОВ ===")
+    df = pd.read_csv(FILTERED_DATA_FILE)
+    df['datetime'] = pd.to_datetime(df['datetime'])
+    df = df.sort_values('datetime')
+
+    print(f"Всего данных: {len(df)}")
+    print(f"Период: {df['datetime'].min()} - {df['datetime'].max()}")
+
+    # ДИАГНОСТИКА ПРИЗНАКОВ
+    print(f"\n=== ДИАГНОСТИКА ПРИЗНАКОВ ===")
+    print(f"Всего колонок в данных: {len(df.columns)}")
+    
+    # АВТОМАТИЧЕСКОЕ ФОРМИРОВАНИЕ ПРИЗНАКОВ
+    # Исключаем колонки, которые не являются признаками
+    excluded_columns = ['datetime', 'consumption', 'date_only', 'date', 'year_month']
+    
+    # Базовые временные и календарные признаки
+    base_patterns = [
+        'hour', 'dayofweek', 'month', 'week_of_year', 'year',
+        'hour_sin', 'hour_cos', 
+        'is_', 'season'
+    ]
+    
+    # Погодные признаки
+    weather_patterns = [
+        'temperature', 'humidity', 'wind_speed',
+        'dew_point', 'pressure_', 'weather_'
+    ]
+    
+    # Временные паттерны потребления
+    temporal_patterns = [
+        'consumption_lag_', 'consumption_rolling_', 'consumption_ewm_'
+    ]
+    
+    # Собираем ВСЕ возможные признаки
+    all_feature_columns = []
+    for col in df.columns:
+        if col in excluded_columns:
+            continue
+            
+        # Проверяем, подходит ли колонка под любой из паттернов
+        is_feature = any(pattern in col for pattern in base_patterns + weather_patterns + temporal_patterns)
+        
+        if is_feature:
+            all_feature_columns.append(col)
+    
+    print(f"Автоматически обнаружено {len(all_feature_columns)} признаков:")
+    for i, col in enumerate(sorted(all_feature_columns)):
+        print(f"{i+1:3d}. {col}")
+    
+    # Проверяем наличие данных в признаках
+    print(f"\n=== ПРОВЕРКА КАЧЕСТВА ПРИЗНАКОВ ===")
+    valid_features = []
+    for col in all_feature_columns:
+        non_null_count = df[col].notna().sum()
+        null_percentage = (df[col].isna().sum() / len(df)) * 100
+        unique_count = df[col].nunique()
+        
+        if non_null_count > 0:  # Признак имеет данные
+            valid_features.append(col)
+            print(f"✓ {col:40} {non_null_count:6} записей, {null_percentage:5.1f}% пропусков, {unique_count:4} уникальных")
+        else:
+            print(f"✗ {col:40} ПУСТОЙ ПРИЗНАК!")
+    
+    feature_columns = valid_features
+    print(f"\nИспользуется {len(feature_columns)} валидных признаков")
+
+    # Определяем категориальные признаки
+    categorical_features = [
+        'hour', 'dayofweek', 'month', 'week_of_year', 'year',
+        'is_holiday', 'is_working_weekend', 'is_regular_weekend', 'is_working_day',
+        'is_weekend_or_holiday', 'is_weekend',
+        'is_winter', 'is_spring', 'is_summer', 'is_autumn',
+        'season'
+    ]
+    
+    # Фильтруем только существующие категориальные признаки
+    categorical_features = [col for col in categorical_features if col in feature_columns]
+    print(f"Категориальных признаков: {len(categorical_features)}")
+
+    # Дальнейший код остается без изменений...
+    X = df[feature_columns]
+    y = df['consumption']
+
+//////////
 def preprocess_weather_data():
     """Расширенная предобработка данных по погоде - ИСПРАВЛЕННАЯ ВЕРСИЯ"""
     print("Загрузка данных по погоде...")
