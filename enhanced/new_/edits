@@ -1,0 +1,175 @@
+def preprocess_weather_data():
+    """Расширенная предобработка данных по погоде - ИСПРАВЛЕННАЯ ВЕРСИЯ"""
+    print("Загрузка данных по погоде...")
+    try:
+        with open(WEATHER_FILE, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+
+        header_line = None
+        data_start = 0
+        for i, line in enumerate(lines):
+            if line.strip().startswith('"Местное время'):
+                header_line = line.strip()
+                data_start = i + 1
+                break
+
+        if header_line is None:
+            print("Ошибка: Не найдена строка с заголовком в файле погоды")
+            return None
+
+        df_weather = pd.read_csv(
+            WEATHER_FILE, 
+            sep=';', 
+            skiprows=data_start,
+            on_bad_lines='skip',
+            encoding='utf-8'
+        )
+
+        if len(df_weather) == 0:
+            print("Ошибка: Файл погоды пуст!")
+            return None
+
+    except FileNotFoundError:
+        print(f"Ошибка: Файл {WEATHER_FILE} не найден!")
+        return None
+    except Exception as e:
+        print(f"Ошибка при загрузке файла погоды: {e}")
+        return None
+
+    # Определяем колонки
+    expected_columns = ['datetime', 'T', 'P0', 'P', 'U', 'DD', 'Ff', 'ff10', 'WW', 'W\'W\'', 'clouds', 'VV', 'Td']
+    
+    if len(df_weather.columns) >= len(expected_columns):
+        df_weather = df_weather.iloc[:, :len(expected_columns)]
+        df_weather.columns = expected_columns
+    else:
+        # Если колонок меньше, пытаемся сопоставить по порядку
+        for i, col in enumerate(df_weather.columns[:len(expected_columns)]):
+            df_weather = df_weather.rename(columns={col: expected_columns[i]})
+
+    # Преобразуем дату
+    try:
+        df_weather['datetime'] = pd.to_datetime(df_weather['datetime'], dayfirst=True)
+    except:
+        try:
+            df_weather['datetime'] = pd.to_datetime(df_weather.iloc[:, 0], dayfirst=True)
+        except Exception as e:
+            print(f"Ошибка при преобразовании даты: {e}")
+            return None
+
+    # Выбираем нужные параметры
+    selected_columns = ['datetime']
+    
+    if WEATHER_PARAMS['temperature_dew'] and 'Td' in df_weather.columns:
+        selected_columns.append('Td')
+        df_weather['Td'] = pd.to_numeric(df_weather['Td'], errors='coerce')
+    
+    if WEATHER_PARAMS['pressure_station'] and 'P0' in df_weather.columns:
+        selected_columns.append('P0')
+        df_weather['P0'] = pd.to_numeric(df_weather['P0'], errors='coerce')
+    
+    if WEATHER_PARAMS['pressure_sea'] and 'P' in df_weather.columns:
+        selected_columns.append('P')
+        df_weather['P'] = pd.to_numeric(df_weather['P'], errors='coerce')
+    
+    if WEATHER_PARAMS['humidity'] and 'U' in df_weather.columns:
+        selected_columns.append('U')
+        df_weather['U'] = pd.to_numeric(df_weather['U'], errors='coerce')
+    
+    if WEATHER_PARAMS['wind_speed'] and 'Ff' in df_weather.columns:
+        selected_columns.append('Ff')
+        df_weather['Ff'] = pd.to_numeric(df_weather['Ff'], errors='coerce')
+    
+    # Обрабатываем погодные явления
+    if WEATHER_PARAMS['weather_phenomena']:
+        weather_phenomena_cols = [col for col in ['WW', 'W\'W\'', 'WW2'] if col in df_weather.columns]
+        if weather_phenomena_cols:
+            selected_columns.extend(weather_phenomena_cols)
+    
+    df_weather = df_weather[selected_columns]
+    
+    # Переименовываем колонки для удобства
+    rename_dict = {
+        'Td': 'dew_point',
+        'P0': 'pressure_station', 
+        'P': 'pressure_sea',
+        'U': 'humidity',
+        'Ff': 'wind_speed'
+    }
+    df_weather = df_weather.rename(columns=rename_dict)
+    
+    # Обрабатываем погодные явления
+    df_weather = extract_weather_phenomena(df_weather)
+    
+    # Усредняем по часам - ИСПРАВЛЕННАЯ ГРУППИРОВКА
+    df_weather['datetime'] = df_weather['datetime'].dt.floor('H')
+    
+    # Разделяем числовые и бинарные колонки
+    numeric_cols = [col for col in df_weather.columns if col not in ['datetime'] and not col.startswith('weather_')]
+    weather_phenomenon_cols = [col for col in df_weather.columns if col.startswith('weather_')]
+    
+    # Для числовых колонок - среднее, для бинарных - максимум (было ли явление в течение часа)
+    aggregation_dict = {}
+    
+    for col in numeric_cols:
+        aggregation_dict[col] = 'mean'
+    
+    for col in weather_phenomenon_cols:
+        aggregation_dict[col] = 'max'  # Если явление было хоть раз в течение часа - ставим 1
+    
+    # Группируем все колонки вместе
+    df_weather = df_weather.groupby('datetime').agg(aggregation_dict).reset_index()
+    
+    print(f"Данные по погоде обработаны. Размер: {len(df_weather)}")
+    print(f"Извлеченные параметры: {[col for col in df_weather.columns if col != 'datetime']}")
+    
+    return df_weather
+
+    def extract_weather_phenomena(df):
+    """Извлечение и классификация погодных явлений - ИСПРАВЛЕННАЯ ВЕРСИЯ"""
+    if not WEATHER_PARAMS['weather_phenomena']:
+        return df
+    
+    print("Обработка погодных явлений...")
+    
+    # Удаляем ранее созданные колонки погодных явлений (если запускаем повторно)
+    existing_weather_cols = [col for col in df.columns if col.startswith('weather_')]
+    if existing_weather_cols:
+        df = df.drop(columns=existing_weather_cols)
+    
+    # Объединяем WW и W'W'
+    weather_columns = []
+    if 'WW' in df.columns:
+        weather_columns.append('WW')
+    if 'W\'W\'' in df.columns:
+        weather_columns.append('W\'W\'')
+    elif 'WW2' in df.columns:
+        weather_columns.append('WW2')
+    
+    if not weather_columns:
+        print("Предупреждение: колонки погодных явлений не найдены")
+        return df
+    
+    # Объединяем все явления в одну строку
+    df['weather_combined'] = ''
+    for col in weather_columns:
+        if col in df.columns:
+            df[col] = df[col].fillna('')
+            df['weather_combined'] = df['weather_combined'] + ' ' + df[col].astype(str)
+    
+    # Нормализуем текст
+    df['weather_normalized'] = df['weather_combined'].apply(normalize_weather_text)
+    
+    # Создаем бинарные признаки для каждого типа явлений
+    for phenomenon, keywords in WEATHER_KEYWORDS.items():
+        pattern = '|'.join(keywords)
+        df[f'weather_{phenomenon}'] = df['weather_normalized'].apply(
+            lambda x: 1 if re.search(pattern, x) else 0
+        )
+        count = df[f'weather_{phenomenon}'].sum()
+        print(f"  {phenomenon}: найдено {count} случаев ({count/len(df)*100:.1f}%)")
+    
+    # Удаляем временные колонки
+    df = df.drop(['weather_combined', 'weather_normalized'] + weather_columns, axis=1, errors='ignore')
+    
+    return df
