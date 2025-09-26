@@ -1,0 +1,183 @@
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+
+# === КОНСТАНТЫ ===
+PROCESSED_DATA_FILE = 'enhanced_processed_energy_data.csv'
+FILTERED_TRAINING_FILE = 'enhanced_filtered_training_data.csv'
+FILTERED_FULL_FILE = 'enhanced_filtered_full_data.csv'
+
+def load_and_filter_quality_data(include_september=False):
+    """Загрузка и фильтрация данных по качеству"""
+    print("=== ФИЛЬТРАЦИЯ ДАННЫХ ПО КАЧЕСТВУ ===")
+    df = pd.read_csv(PROCESSED_DATA_FILE)
+    df['datetime'] = pd.to_datetime(df['datetime'])
+    print(f"Исходные данные: {len(df)} записей")
+
+    df['year'] = df['datetime'].dt.year
+    df['month'] = df['datetime'].dt.month
+
+    # Проблемные годы (можно настраивать)
+    problematic_years = [2017]
+    df_filtered = df[~df['year'].isin(problematic_years)]
+    print(f"После фильтрации проблемных лет: {len(df_filtered)} записей")
+
+    # Исключаем сентябрь 2025 только для обучающей выборки
+    if not include_september:
+        df_filtered = df_filtered[
+            ~((df_filtered['year'] == 2025) & (df_filtered['month'] == 9))
+        ]
+        print(f"После исключения сентября 2025: {len(df_filtered)} записей")
+
+    # Фильтр по полноте данных для новых погодных параметров
+    df_filtered['year_month'] = df_filtered['datetime'].dt.to_period('M')
+    monthly_stats = df_filtered.groupby('year_month').agg({
+        'consumption': 'count',
+        'temperature': lambda x: x.notna().sum(),
+        'humidity': lambda x: x.notna().sum(),
+        'wind_speed': lambda x: x.notna().sum(),
+        'dew_point': lambda x: x.notna().sum() if 'dew_point' in df_filtered.columns else pd.Series([len(df_filtered)] * len(df_filtered)),
+        'pressure_station': lambda x: x.notna().sum() if 'pressure_station' in df_filtered.columns else pd.Series([len(df_filtered)] * len(df_filtered)),
+        'pressure_sea': lambda x: x.notna().sum() if 'pressure_sea' in df_filtered.columns else pd.Series([len(df_filtered)] * len(df_filtered))
+    }).rename(columns={'consumption': 'total_records'})
+
+    # Проверяем полноту для всех погодных параметров
+    weather_columns = ['temperature', 'humidity', 'wind_speed']
+    if 'dew_point' in df_filtered.columns:
+        weather_columns.append('dew_point')
+    if 'pressure_station' in df_filtered.columns:
+        weather_columns.append('pressure_station')
+    if 'pressure_sea' in df_filtered.columns:
+        weather_columns.append('pressure_sea')
+    
+    for col in weather_columns:
+        monthly_stats[f'{col}_completeness'] = monthly_stats[col] / monthly_stats['total_records']
+
+    # Фильтр: все погодные параметры должны быть заполнены > 80%
+    completeness_conditions = [monthly_stats[f'{col}_completeness'] > 0.8 for col in weather_columns]
+    if completeness_conditions:
+        complete_condition = completeness_conditions[0]
+        for condition in completeness_conditions[1:]:
+            complete_condition &= condition
+        
+        good_months = monthly_stats[complete_condition].index
+        df_filtered = df_filtered[df_filtered['year_month'].isin(good_months)]
+    
+    print(f"После фильтрации по полноте: {len(df_filtered)} записей")
+
+    return df_filtered
+
+def handle_missing_values(df):
+    """Расширенная обработка пропусков для новых признаков"""
+    print("=== ОБРАБОТКА ПРОПУСКОВ ===")
+    missing_stats = df.isnull().sum()
+    for col, count in missing_stats[missing_stats > 0].items():
+        print(f"  {col}: {count} ({count/len(df)*100:.2f}%)")
+
+    # Группируем колонки для обработки
+    basic_weather_cols = ['temperature', 'humidity', 'wind_speed']
+    advanced_weather_cols = []
+    weather_phenomenon_cols = [col for col in df.columns if col.startswith('weather_')]
+    lag_cols = [col for col in df.columns if 'consumption_lag_' in col]
+    rolling_cols = [col for col in df.columns if 'consumption_rolling_' in col]
+    ewm_cols = [col for col in df.columns if 'consumption_ewm_' in col]
+    
+    # Добавляем новые погодные параметры, если они есть
+    if 'dew_point' in df.columns:
+        advanced_weather_cols.append('dew_point')
+    if 'pressure_station' in df.columns:
+        advanced_weather_cols.append('pressure_station')
+    if 'pressure_sea' in df.columns:
+        advanced_weather_cols.append('pressure_sea')
+    
+    all_weather_cols = basic_weather_cols + advanced_weather_cols
+
+    # Интерполяция погодных данных
+    for col in all_weather_cols:
+        if col in df.columns:
+            df[col] = df.groupby(df['datetime'].dt.date)[col].transform(
+                lambda x: x.interpolate(method='linear', limit=3, limit_direction='both')
+            )
+            # Заполняем оставшиеся пропуски средним по часу
+            hourly_mean = df.groupby('hour')[col].transform('mean')
+            df[col] = df[col].fillna(hourly_mean)
+
+    # Для погодных явлений заполняем 0 (отсутствие явления)
+    for col in weather_phenomenon_cols:
+        if col in df.columns:
+            df[col] = df[col].fillna(0)
+
+    # Интерполяция лаговых и скользящих признаков
+    for col in lag_cols + rolling_cols + ewm_cols:
+        if col in df.columns:
+            df[col] = df[col].interpolate(method='linear', limit_direction='both')
+
+    # Финальное заполнение медианой для числовых колонок
+    numeric_cols = all_weather_cols + lag_cols + rolling_cols + ewm_cols
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = df[col].fillna(df[col].median())
+
+    print("Пропуски после обработки:")
+    final_missing = df.isnull().sum()
+    missing_cols = final_missing[final_missing > 0]
+    if len(missing_cols) == 0:
+        print("  Все пропуски устранены!")
+    else:
+        for col, count in missing_cols.items():
+            print(f"  {col}: {count} ({count/len(df)*100:.2f}%)")
+
+    return df
+
+def create_final_dataset():
+    """Создание финального датасета"""
+    print("=== СОЗДАНИЕ ФИНАЛЬНЫХ ДАТАСЕТОВ ===")
+    
+    # Загружаем полный набор качественных данных
+    df_full = load_and_filter_quality_data(include_september=True)
+    df_full = handle_missing_values(df_full)
+    
+    # Удаляем оставшиеся строки с пропусками в критических колонках
+    critical_cols = ['consumption', 'temperature', 'humidity', 'wind_speed']
+    # Добавляем новые погодные параметры, если они есть
+    if 'dew_point' in df_full.columns:
+        critical_cols.append('dew_point')
+    if 'pressure_station' in df_full.columns:
+        critical_cols.append('pressure_station')
+    
+    df_full = df_full.dropna(subset=[col for col in critical_cols if col in df_full.columns])
+    
+    print(f"Полный отфильтрованный датасет: {len(df_full)} записей")
+    
+    # Создаем датасет для обучения (исключаем сентябрь 2025)
+    df_for_training = df_full[~((df_full['year'] == 2025) & (df_full['month'] == 9))]
+    print(f"Датасет для обучения (без сентября 2025): {len(df_for_training)} записей")
+    
+    # Сохраняем оба файла
+    df_for_training.to_csv(FILTERED_TRAINING_FILE, index=False)
+    df_full.to_csv(FILTERED_FULL_FILE, index=False)
+    
+    print(f"Датасет для обучения сохранен в {FILTERED_TRAINING_FILE}")
+    print(f"Полный датасет (для теста) сохранен в {FILTERED_FULL_FILE}")
+    
+    # Статистика по новым признакам
+    print(f"\n=== СТАТИСТИКА ПО НОВЫМ ПРИЗНАКАМ ===")
+    new_features = [col for col in df_full.columns if col.startswith('weather_') or 
+                   col in ['dew_point', 'pressure_station', 'pressure_sea']]
+    
+    for feature in new_features:
+        if feature in df_full.columns:
+            if feature.startswith('weather_'):
+                # Бинарные признаки
+                total = len(df_full)
+                present = df_full[feature].sum()
+                print(f"{feature}: {present}/{total} ({present/total*100:.1f}%)")
+            else:
+                # Числовые признаки
+                print(f"{feature}: min={df_full[feature].min():.1f}, max={df_full[feature].max():.1f}, mean={df_full[feature].mean():.1f}")
+
+    return df_for_training, df_full
+
+if __name__ == "__main__":
+    df_train, df_full = create_final_dataset()
+    print("\nРасширенная финальная предобработка завершена успешно!")
