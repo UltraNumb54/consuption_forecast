@@ -1,0 +1,316 @@
+# enhanced_visualization.py
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from datetime import datetime, timedelta
+import warnings
+warnings.filterwarnings('ignore')
+
+# Настройка стиля графиков
+plt.style.use('seaborn-v0_8')
+sns.set_palette("husl")
+
+def load_and_prepare_data():
+    """Загрузка и подготовка данных для визуализации"""
+    
+    # Загружаем результаты симуляции
+    results_1d = pd.read_csv('sim_1day_2025.csv')
+    results_3d = pd.read_csv('sim_3day_2025.csv')
+    
+    # Загружаем исходные данные для анализа временных рядов
+    df_full = pd.read_csv('enhanced_filtered_full_data.csv')
+    df_full['datetime'] = pd.to_datetime(df_full['datetime'])
+    
+    # Добавляем месяц и день недели для группировки
+    results_1d['date'] = pd.to_datetime(results_1d['date'])
+    results_3d['date'] = pd.to_datetime(results_3d['date'])
+    
+    results_1d['month'] = results_1d['date'].dt.month
+    results_3d['month'] = results_3d['date'].dt.month
+    results_1d['month_name'] = results_1d['date'].dt.month_name()
+    results_3d['month_name'] = results_3d['date'].dt.month_name()
+    
+    return results_1d, results_3d, df_full
+
+def plot_monthly_errors(results_1d, results_3d):
+    """Визуализация ошибок по месяцам"""
+    
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    fig.suptitle('Анализ ошибок прогнозирования по месяцам (2025 год)', fontsize=16, fontweight='bold')
+    
+    # MAE по месяцам
+    monthly_1d = results_1d.groupby('month_name')[['mae', 'mape']].mean().reindex([
+        'January', 'February', 'March', 'April', 'May', 'June',
+        'July', 'August', 'September', 'October', 'November', 'December'
+    ]).dropna()
+    
+    monthly_3d = results_3d.groupby('month_name')[['mae', 'mape']].mean().reindex([
+        'January', 'February', 'March', 'April', 'May', 'June',
+        'July', 'August', 'September', 'October', 'November', 'December'
+    ]).dropna()
+    
+    # График MAE
+    axes[0, 0].bar(monthly_1d.index, monthly_1d['mae'], alpha=0.7, label='1 день', color='skyblue')
+    axes[0, 0].bar(monthly_3d.index, monthly_3d['mae'], alpha=0.7, label='3 дня', color='lightcoral')
+    axes[0, 0].set_title('Средний MAE по месяцам')
+    axes[0, 0].set_ylabel('MAE (МВт)')
+    axes[0, 0].tick_params(axis='x', rotation=45)
+    axes[0, 0].legend()
+    axes[0, 0].grid(True, alpha=0.3)
+    
+    # График MAPE
+    axes[0, 1].bar(monthly_1d.index, monthly_1d['mape'], alpha=0.7, label='1 день', color='skyblue')
+    axes[0, 1].bar(monthly_3d.index, monthly_3d['mape'], alpha=0.7, label='3 дня', color='lightcoral')
+    axes[0, 1].set_title('Средний MAPE по месяцам')
+    axes[0, 1].set_ylabel('MAPE (%)')
+    axes[0, 1].tick_params(axis='x', rotation=45)
+    axes[0, 1].legend()
+    axes[0, 1].grid(True, alpha=0.3)
+    
+    # Boxplot MAE по месяцам (1 день)
+    monthly_mae_data_1d = []
+    months_1d = []
+    for month in results_1d['month_name'].unique():
+        monthly_data = results_1d[results_1d['month_name'] == month]['mae']
+        monthly_mae_data_1d.append(monthly_data)
+        months_1d.append(month)
+    
+    axes[1, 0].boxplot(monthly_mae_data_1d, labels=months_1d)
+    axes[1, 0].set_title('Распределение MAE по месяцам (прогноз на 1 день)')
+    axes[1, 0].set_ylabel('MAE (МВт)')
+    axes[1, 0].tick_params(axis='x', rotation=45)
+    axes[1, 0].grid(True, alpha=0.3)
+    
+    # Boxplot MAE по месяцам (3 дня)
+    monthly_mae_data_3d = []
+    months_3d = []
+    for month in results_3d['month_name'].unique():
+        monthly_data = results_3d[results_3d['month_name'] == month]['mae']
+        monthly_mae_data_3d.append(monthly_data)
+        months_3d.append(month)
+    
+    axes[1, 1].boxplot(monthly_mae_data_3d, labels=months_3d)
+    axes[1, 1].set_title('Распределение MAE по месяцам (прогноз на 3 дня)')
+    axes[1, 1].set_ylabel('MAE (МВт)')
+    axes[1, 1].tick_params(axis='x', rotation=45)
+    axes[1, 1].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig('monthly_errors_analysis.png', dpi=300, bbox_inches='tight')
+    plt.show()
+    
+    return monthly_1d, monthly_3d
+
+def plot_seasonal_patterns(df_full):
+    """Визуализация сезонных паттернов потребления"""
+    
+    # Анализ по месяцам
+    df_full['month'] = df_full['datetime'].dt.month
+    df_full['hour'] = df_full['datetime'].dt.hour
+    df_full['day_type'] = np.where(df_full['is_weekend_or_holiday'] == 1, 'Выходной', 'Рабочий')
+    
+    monthly_consumption = df_full.groupby('month')['consumption'].agg(['mean', 'std', 'min', 'max'])
+    
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    fig.suptitle('Сезонные паттерны потребления электроэнергии', fontsize=16, fontweight='bold')
+    
+    # Среднее потребление по месяцам
+    months_names = ['Янв', 'Фев', 'Мар', 'Апр', 'Май', 'Июн', 
+                   'Июл', 'Авг', 'Сен', 'Окт', 'Ноя', 'Дек']
+    axes[0, 0].plot(months_names, monthly_consumption['mean'], marker='o', linewidth=2)
+    axes[0, 0].fill_between(months_names, 
+                           monthly_consumption['mean'] - monthly_consumption['std'],
+                           monthly_consumption['mean'] + monthly_consumption['std'],
+                           alpha=0.3)
+    axes[0, 0].set_title('Среднее потребление по месяцам ± STD')
+    axes[0, 0].set_ylabel('Потребление (МВт)')
+    axes[0, 0].grid(True, alpha=0.3)
+    
+    # Суточные профили по сезонам
+    seasons = {
+        'Зима': [12, 1, 2],
+        'Весна': [3, 4, 5],
+        'Лето': [6, 7, 8],
+        'Осень': [9, 10, 11]
+    }
+    
+    for season, months in seasons.items():
+        season_data = df_full[df_full['month'].isin(months)]
+        hourly_profile = season_data.groupby('hour')['consumption'].mean()
+        axes[0, 1].plot(hourly_profile.index, hourly_profile.values, 
+                       label=season, linewidth=2, marker='o')
+    
+    axes[0, 1].set_title('Суточные профили потребления по сезонам')
+    axes[0, 1].set_xlabel('Час дня')
+    axes[0, 1].set_ylabel('Потребление (МВт)')
+    axes[0, 1].legend()
+    axes[0, 1].grid(True, alpha=0.3)
+    
+    # Потребление в рабочие vs выходные дни
+    weekday_profile = df_full[df_full['day_type'] == 'Рабочий'].groupby('hour')['consumption'].mean()
+    weekend_profile = df_full[df_full['day_type'] == 'Выходной'].groupby('hour')['consumption'].mean()
+    
+    axes[1, 0].plot(weekday_profile.index, weekday_profile.values, 
+                   label='Рабочие дни', linewidth=2)
+    axes[1, 0].plot(weekend_profile.index, weekend_profile.values, 
+                   label='Выходные дни', linewidth=2)
+    axes[1, 0].set_title('Сравнение профилей: рабочие vs выходные дни')
+    axes[1, 0].set_xlabel('Час дня')
+    axes[1, 0].set_ylabel('Потребление (МВт)')
+    axes[1, 0].legend()
+    axes[1, 0].grid(True, alpha=0.3)
+    
+    # Тепловая карта потребления по часам и месяцам
+    heatmap_data = df_full.pivot_table(values='consumption', 
+                                      index='hour', 
+                                      columns='month', 
+                                      aggfunc='mean')
+    im = axes[1, 1].imshow(heatmap_data, aspect='auto', cmap='viridis')
+    axes[1, 1].set_title('Тепловая карта: час дня × месяц')
+    axes[1, 1].set_xlabel('Месяц')
+    axes[1, 1].set_ylabel('Час дня')
+    axes[1, 1].set_xticks(range(len(months_names)))
+    axes[1, 1].set_xticklabels(months_names)
+    plt.colorbar(im, ax=axes[1, 1], label='Потребление (МВт)')
+    
+    plt.tight_layout()
+    plt.savefig('seasonal_patterns_analysis.png', dpi=300, bbox_inches='tight')
+    plt.show()
+    
+    return monthly_consumption
+
+def plot_error_trends(results_1d, results_3d):
+    """Визуализация трендов ошибок во времени"""
+    
+    fig, axes = plt.subplots(3, 1, figsize=(15, 12))
+    fig.suptitle('Динамика ошибок прогнозирования во времени', fontsize=16, fontweight='bold')
+    
+    # MAE во времени
+    axes[0].plot(results_1d['date'], results_1d['mae'], 
+                label='Прогноз на 1 день', alpha=0.7, linewidth=1, marker='o', markersize=2)
+    axes[0].plot(results_3d['date'], results_3d['mae'], 
+                label='Прогноз на 3 дня', alpha=0.7, linewidth=1, marker='s', markersize=2)
+    axes[0].set_title('Динамика MAE')
+    axes[0].set_ylabel('MAE (МВт)')
+    axes[0].legend()
+    axes[0].grid(True, alpha=0.3)
+    axes[0].tick_params(axis='x', rotation=45)
+    
+    # MAPE во времени
+    axes[1].plot(results_1d['date'], results_1d['mape'], 
+                label='Прогноз на 1 день', alpha=0.7, linewidth=1, marker='o', markersize=2)
+    axes[1].plot(results_3d['date'], results_3d['mape'], 
+                label='Прогноз на 3 дня', alpha=0.7, linewidth=1, marker='s', markersize=2)
+    axes[1].set_title('Динамика MAPE')
+    axes[1].set_ylabel('MAPE (%)')
+    axes[1].legend()
+    axes[1].grid(True, alpha=0.3)
+    axes[1].tick_params(axis='x', rotation=45)
+    
+    # Скользящее среднее ошибок (7 дней)
+    results_1d['mae_rolling'] = results_1d['mae'].rolling(window=7, center=True).mean()
+    results_3d['mae_rolling'] = results_3d['mae'].rolling(window=7, center=True).mean()
+    
+    axes[2].plot(results_1d['date'], results_1d['mae_rolling'], 
+                label='MAE 1 день (7-дневное скользящее)', linewidth=2)
+    axes[2].plot(results_3d['date'], results_3d['mae_rolling'], 
+                label='MAE 3 дня (7-дневное скользящее)', linewidth=2)
+    axes[2].set_title('Сглаженные ошибки (7-дневное скользящее среднее)')
+    axes[2].set_ylabel('MAE (МВт)')
+    axes[2].set_xlabel('Дата')
+    axes[2].legend()
+    axes[2].grid(True, alpha=0.3)
+    axes[2].tick_params(axis='x', rotation=45)
+    
+    plt.tight_layout()
+    plt.savefig('error_trends_analysis.png', dpi=300, bbox_inches='tight')
+    plt.show()
+
+def create_summary_report(results_1d, results_3d, monthly_consumption):
+    """Создание сводного отчета"""
+    
+    print("="*60)
+    print("СВОДНЫЙ ОТЧЕТ ПО РЕЗУЛЬТАТАМ ПРОГНОЗИРОВАНИЯ")
+    print("="*60)
+    
+    # Общая статистика
+    print(f"\nОБЩАЯ СТАТИСТИКА:")
+    print(f"Период анализа: {results_1d['date'].min()} - {results_1d['date'].max()}")
+    print(f"Количество прогнозов на 1 день: {len(results_1d)}")
+    print(f"Количество прогнозов на 3 дня: {len(results_3d)}")
+    
+    # Статистика ошибок
+    print(f"\nСТАТИСТИКА ОШИБОК (1 день):")
+    print(f"Средний MAE: {results_1d['mae'].mean():.3f} МВт")
+    print(f"Медианный MAE: {results_1d['mae'].median():.3f} МВт")
+    print(f"Средний MAPE: {results_1d['mape'].mean():.2f}%")
+    print(f"Лучший MAPE: {results_1d['mape'].min():.2f}%")
+    print(f"Худший MAPE: {results_1d['mape'].max():.2f}%")
+    
+    print(f"\nСТАТИСТИКА ОШИБОК (3 дня):")
+    print(f"Средний MAE: {results_3d['mae'].mean():.3f} МВт")
+    print(f"Медианный MAE: {results_3d['mae'].median():.3f} МВт")
+    print(f"Средний MAPE: {results_3d['mape'].mean():.2f}%")
+    print(f"Лучший MAPE: {results_3d['mape'].min():.2f}%")
+    print(f"Худший MAPE: {results_3d['mape'].max():.2f}%")
+    
+    # Анализ по сезонам
+    seasons_analysis = {
+        'Зима (12,1,2)': [12, 1, 2],
+        'Весна (3,4,5)': [3, 4, 5],
+        'Лето (6,7,8)': [6, 7, 8],
+        'Осень (9,10,11)': [9, 10, 11]
+    }
+    
+    print(f"\nАНАЛИЗ ПО СЕЗОНАМ (1 день):")
+    for season, months in seasons_analysis.items():
+        season_data = results_1d[results_1d['month'].isin(months)]
+        if len(season_data) > 0:
+            print(f"{season}: MAPE = {season_data['mape'].mean():.2f}%")
+    
+    print(f"\nАНАЛИЗ ПО СЕЗОНАМ (3 дня):")
+    for season, months in seasons_analysis.items():
+        season_data = results_3d[results_3d['month'].isin(months)]
+        if len(season_data) > 0:
+            print(f"{season}: MAPE = {season_data['mape'].mean():.2f}%")
+    
+    # Сохранение отчета в файл
+    with open('forecast_summary_report.txt', 'w', encoding='utf-8') as f:
+        f.write("ОТЧЕТ ПО РЕЗУЛЬТАТАМ ПРОГНОЗИРОВАНИЯ\n")
+        f.write("="*50 + "\n")
+        f.write(f"Период анализа: {results_1d['date'].min()} - {results_1d['date'].max()}\n")
+        f.write(f"Общее количество прогнозов: {len(results_1d) + len(results_3d)}\n\n")
+        
+        f.write("СТАТИСТИКА ОШИБОК:\n")
+        f.write(f"Прогноз на 1 день - MAE: {results_1d['mae'].mean():.3f}, MAPE: {results_1d['mape'].mean():.2f}%\n")
+        f.write(f"Прогноз на 3 дня - MAE: {results_3d['mae'].mean():.3f}, MAPE: {results_3d['mape'].mean():.2f}%\n")
+    
+    print(f"\nПодробный отчет сохранен в forecast_summary_report.txt")
+
+def main():
+    """Основная функция визуализации"""
+    
+    print("Загрузка данных...")
+    results_1d, results_3d, df_full = load_and_prepare_data()
+    
+    print("Построение графиков ошибок по месяцам...")
+    monthly_1d, monthly_3d = plot_monthly_errors(results_1d, results_3d)
+    
+    print("Анализ сезонных паттернов...")
+    monthly_consumption = plot_seasonal_patterns(df_full)
+    
+    print("Анализ трендов ошибок...")
+    plot_error_trends(results_1d, results_3d)
+    
+    print("Генерация сводного отчета...")
+    create_summary_report(results_1d, results_3d, monthly_consumption)
+    
+    print("\nВизуализация завершена! Созданы файлы:")
+    print("- monthly_errors_analysis.png")
+    print("- seasonal_patterns_analysis.png") 
+    print("- error_trends_analysis.png")
+    print("- forecast_summary_report.txt")
+
+if __name__ == "__main__":
+    main()
