@@ -1,0 +1,363 @@
+import pandas as pd
+import numpy as np
+import re
+from datetime import datetime, timedelta
+
+# === КОНСТАНТЫ ===
+CONSUMPTION_FILE = 'consumption_data.csv'
+WEATHER_FILE = 'weather_data.csv'
+CALENDAR_FILE = 'russian_production_calendar_2017_2025.csv'
+OUTPUT_FILE = 'enhanced_processed_energy_data.csv'
+
+# === НАСТРАИВАЕМЫЕ ПАРАМЕТРЫ ===
+# Список погодных параметров для извлечения (можно легко включать/выключать)
+WEATHER_PARAMS = {
+    'temperature_dew': True,      # Температура точки росы (Td)
+    'pressure_station': True,     # Давление на уровне станции (P0)
+    'pressure_sea': True,         # Давление на уровне моря (P)
+    'humidity': True,             # Влажность (U) - уже было
+    'wind_speed': True,           # Скорость ветра (Ff) - уже было
+    'weather_phenomena': True     # Погодные явления (WW + W'W')
+}
+
+# Словарь для классификации погодных явлений (можно расширять)
+WEATHER_KEYWORDS = {
+    'rain': ['дождь', 'ливень'],
+    'thunderstorm': ['гроза'],
+    'fog': ['туман', 'дымка'],
+    'snow': ['снег', 'снегопад'],
+    'hail': ['град'],
+    'storm': ['шторм', 'шквал']
+}
+
+def normalize_weather_text(text):
+    """Нормализация текста погодных явлений"""
+    if pd.isna(text) or text == '':
+        return ''
+    
+    # Приводим к нижнему регистру
+    text = str(text).lower()
+    
+    # Заменяем спецсимволы и знаки препинания на пробелы
+    text = re.sub(r'[^\w\s]', ' ', text)
+    
+    # Убираем лишние пробелы
+    text = re.sub(r'\s+', ' ', text).strip()
+    
+    return text
+
+def extract_weather_phenomena(df):
+    """Извлечение и классификация погодных явлений"""
+    if not WEATHER_PARAMS['weather_phenomena']:
+        return df
+    
+    print("Обработка погодных явлений...")
+    
+    # Объединяем WW и W'W'
+    weather_columns = []
+    if 'WW' in df.columns:
+        weather_columns.append('WW')
+    if 'W\'W\'' in df.columns:
+        weather_columns.append('W\'W\'')
+    elif 'WW2' in df.columns:  # На случай если колонка названа WW2
+        weather_columns.append('WW2')
+    
+    if not weather_columns:
+        print("Предупреждение: колонки погодных явлений не найдены")
+        return df
+    
+    # Объединяем все явления в одну строку
+    df['weather_combined'] = ''
+    for col in weather_columns:
+        df[col] = df[col].fillna('')
+        df['weather_combined'] = df['weather_combined'] + ' ' + df[col].astype(str)
+    
+    # Нормализуем текст
+    df['weather_normalized'] = df['weather_combined'].apply(normalize_weather_text)
+    
+    # Создаем бинарные признаки для каждого типа явлений
+    for phenomenon, keywords in WEATHER_KEYWORDS.items():
+        pattern = '|'.join(keywords)
+        df[f'weather_{phenomenon}'] = df['weather_normalized'].apply(
+            lambda x: 1 if re.search(pattern, x) else 0
+        )
+        print(f"  {phenomenon}: найдено {df[f'weather_{phenomenon}'].sum()} случаев")
+    
+    # Удаляем временные колонки
+    df = df.drop(['weather_combined', 'weather_normalized'] + weather_columns, axis=1, errors='ignore')
+    
+    return df
+
+def preprocess_consumption_data():
+    """Предобработка данных по потреблению (без изменений)"""
+    print("Загрузка данных по потреблению...")
+    try:
+        df_consumption = pd.read_csv(CONSUMPTION_FILE, sep=';', parse_dates=['date'])
+    except FileNotFoundError:
+        print(f"Ошибка: Файл {CONSUMPTION_FILE} не найден!")
+        return None
+
+    # Преобразуем дату + час в datetime
+    df_consumption['datetime'] = pd.to_datetime(df_consumption['date']) + pd.to_timedelta(df_consumption['hour'], unit='h')
+    
+    # Удаляем строки с пропусками в ключевых полях
+    df_consumption = df_consumption.dropna(subset=['consumption', 'temperature'])
+    
+    # Удаляем температурный прогноз
+    if 'temperature_forecast' in df_consumption.columns:
+        df_consumption = df_consumption.drop(columns=['temperature_forecast'])
+    
+    # Создаем базовые признаки
+    df_consumption['date_only'] = df_consumption['datetime'].dt.date
+    df_consumption['hour'] = df_consumption['datetime'].dt.hour
+    df_consumption['dayofweek'] = df_consumption['datetime'].dt.dayofweek
+    df_consumption['month'] = df_consumption['datetime'].dt.month
+    df_consumption['year'] = df_consumption['datetime'].dt.year
+    df_consumption['week_of_year'] = df_consumption['datetime'].dt.isocalendar().week
+    
+    # Циклические признаки для часа
+    df_consumption['hour_sin'] = np.sin(2 * np.pi * df_consumption['hour'] / 24)
+    df_consumption['hour_cos'] = np.cos(2 * np.pi * df_consumption['hour'] / 24)
+    
+    # Признак времени года
+    df_consumption['season'] = df_consumption['month'] % 12 // 3 + 1
+    df_consumption['is_winter'] = (df_consumption['season'] == 1).astype(int)
+    df_consumption['is_spring'] = (df_consumption['season'] == 2).astype(int)
+    df_consumption['is_summer'] = (df_consumption['season'] == 3).astype(int)
+    df_consumption['is_autumn'] = (df_consumption['season'] == 4).astype(int)
+    
+    df_consumption['is_weekend'] = df_consumption['dayofweek'].isin([5, 6]).astype(int)
+
+    print(f"Данные по потреблению обработаны. Размер: {len(df_consumption)}")
+    return df_consumption
+
+def preprocess_weather_data():
+    """Расширенная предобработка данных по погоде"""
+    print("Загрузка данных по погоде...")
+    try:
+        with open(WEATHER_FILE, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+
+        header_line = None
+        data_start = 0
+        for i, line in enumerate(lines):
+            if line.strip().startswith('"Местное время'):
+                header_line = line.strip()
+                data_start = i + 1
+                break
+
+        if header_line is None:
+            print("Ошибка: Не найдена строка с заголовком в файле погоды")
+            return None
+
+        df_weather = pd.read_csv(
+            WEATHER_FILE, 
+            sep=';', 
+            skiprows=data_start,
+            on_bad_lines='skip',
+            encoding='utf-8'
+        )
+
+        if len(df_weather) == 0:
+            print("Ошибка: Файл погоды пуст!")
+            return None
+
+    except FileNotFoundError:
+        print(f"Ошибка: Файл {WEATHER_FILE} не найден!")
+        return None
+    except Exception as e:
+        print(f"Ошибка при загрузке файла погоды: {e}")
+        return None
+
+    # Определяем колонки
+    expected_columns = ['datetime', 'T', 'P0', 'P', 'U', 'DD', 'Ff', 'ff10', 'WW', 'W\'W\'', 'clouds', 'VV', 'Td']
+    
+    if len(df_weather.columns) >= len(expected_columns):
+        df_weather = df_weather.iloc[:, :len(expected_columns)]
+        df_weather.columns = expected_columns
+    else:
+        # Если колонок меньше, пытаемся сопоставить по порядку
+        for i, col in enumerate(df_weather.columns[:len(expected_columns)]):
+            df_weather = df_weather.rename(columns={col: expected_columns[i]})
+
+    # Преобразуем дату
+    try:
+        df_weather['datetime'] = pd.to_datetime(df_weather['datetime'], dayfirst=True)
+    except:
+        try:
+            df_weather['datetime'] = pd.to_datetime(df_weather.iloc[:, 0], dayfirst=True)
+        except Exception as e:
+            print(f"Ошибка при преобразовании даты: {e}")
+            return None
+
+    # Выбираем нужные параметры
+    selected_columns = ['datetime']
+    
+    if WEATHER_PARAMS['temperature_dew'] and 'Td' in df_weather.columns:
+        selected_columns.append('Td')
+        df_weather['Td'] = pd.to_numeric(df_weather['Td'], errors='coerce')
+    
+    if WEATHER_PARAMS['pressure_station'] and 'P0' in df_weather.columns:
+        selected_columns.append('P0')
+        df_weather['P0'] = pd.to_numeric(df_weather['P0'], errors='coerce')
+    
+    if WEATHER_PARAMS['pressure_sea'] and 'P' in df_weather.columns:
+        selected_columns.append('P')
+        df_weather['P'] = pd.to_numeric(df_weather['P'], errors='coerce')
+    
+    if WEATHER_PARAMS['humidity'] and 'U' in df_weather.columns:
+        selected_columns.append('U')
+        df_weather['U'] = pd.to_numeric(df_weather['U'], errors='coerce')
+    
+    if WEATHER_PARAMS['wind_speed'] and 'Ff' in df_weather.columns:
+        selected_columns.append('Ff')
+        df_weather['Ff'] = pd.to_numeric(df_weather['Ff'], errors='coerce')
+    
+    # Обрабатываем погодные явления
+    if WEATHER_PARAMS['weather_phenomena']:
+        weather_phenomena_cols = [col for col in ['WW', 'W\'W\'', 'WW2'] if col in df_weather.columns]
+        if weather_phenomena_cols:
+            selected_columns.extend(weather_phenomena_cols)
+    
+    df_weather = df_weather[selected_columns]
+    
+    # Переименовываем колонки для удобства
+    rename_dict = {
+        'Td': 'dew_point',
+        'P0': 'pressure_station', 
+        'P': 'pressure_sea',
+        'U': 'humidity',
+        'Ff': 'wind_speed'
+    }
+    df_weather = df_weather.rename(columns=rename_dict)
+    
+    # Обрабатываем погодные явления
+    df_weather = extract_weather_phenomena(df_weather)
+    
+    # Усредняем по часам
+    df_weather['datetime'] = df_weather['datetime'].dt.floor('H')
+    numeric_cols = df_weather.select_dtypes(include=[np.number]).columns.tolist()
+    
+    # Для числовых колонок - среднее, для бинарных погодных явлений - максимум (было ли явление в течение часа)
+    weather_phenomenon_cols = [col for col in df_weather.columns if col.startswith('weather_')]
+    
+    if weather_phenomenon_cols:
+        # Группируем отдельно для числовых и бинарных колонок
+        numeric_agg = df_weather[numeric_cols + ['datetime']].groupby('datetime').mean()
+        weather_agg = df_weather[weather_phenomenon_cols + ['datetime']].groupby('datetime').max()
+        
+        df_weather = pd.merge(numeric_agg, weather_agg, on='datetime', how='outer')
+    else:
+        df_weather = df_weather.groupby('datetime').mean().reset_index()
+    
+    print(f"Данные по погоде обработаны. Размер: {len(df_weather)}")
+    print(f"Извлеченные параметры: {[col for col in df_weather.columns if col != 'datetime']}")
+    
+    return df_weather
+
+def load_calendar():
+    """Загрузка существующего производственного календаря"""
+    print("Загрузка производственного календаря...")
+    try:
+        df_calendar = pd.read_csv(CALENDAR_FILE)
+        df_calendar['date'] = pd.to_datetime(df_calendar['date']).dt.date
+        return df_calendar
+    except FileNotFoundError:
+        print(f"Ошибка: Файл {CALENDAR_FILE} не найден!")
+        return None
+
+def create_lag_features(df, lag_hours=None):
+    """Создание лаговых признаков"""
+    if lag_hours is None:
+        lag_hours = [1, 2, 3, 24, 48, 72, 120, 168]
+    
+    print("Создание лаговых признаков...")
+    for lag in lag_hours:
+        df[f'consumption_lag_{lag}'] = df['consumption'].shift(lag)
+    return df
+
+def create_rolling_features(df, windows=None):
+    """Создание скользящих признаков"""
+    if windows is None:
+        windows = [3, 6, 12, 24, 720]
+    
+    print("Создание скользящих признаков...")
+    for window in windows:
+        df[f'consumption_rolling_mean_{window}'] = df['consumption'].rolling(window=window).mean()
+        df[f'consumption_rolling_std_{window}'] = df['consumption'].rolling(window=window).std()
+    return df
+
+def create_ewm_features(df, spans=None):
+    """Создание признаков экспоненциального сглаживания"""
+    if spans is None:
+        spans = [3, 6, 12, 24]
+    
+    print("Создание признаков экспоненциального сглаживания...")
+    for span in spans:
+        df[f'consumption_ewm_mean_{span}'] = df['consumption'].ewm(span=span).mean()
+    return df
+
+def main():
+    """Основная функция предобработки"""
+    print("=== РАСШИРЕННАЯ ПРЕДОБРАБОТКА ДАННЫХ ===")
+    print(f"Извлекаемые погодные параметры: {[k for k, v in WEATHER_PARAMS.items() if v]}")
+    print(f"Ключевые слова для погодных явлений: {list(WEATHER_KEYWORDS.keys())}")
+
+    df_consumption = preprocess_consumption_data()
+    if df_consumption is None:
+        return
+
+    df_weather = preprocess_weather_data()
+    if df_weather is None:
+        return
+
+    df_calendar = load_calendar()
+    if df_calendar is None:
+        return
+
+    print("Объединение датасетов...")
+    # Объединяем с расширенными погодными данными
+    df_merged = pd.merge(df_consumption, df_weather, on='datetime', how='left')
+
+    df_merged['date_for_merge'] = pd.to_datetime(df_merged['date_only'])
+    df_calendar['date_for_merge'] = pd.to_datetime(df_calendar['date'])
+    df_final = pd.merge(df_merged, df_calendar, left_on='date_for_merge', right_on='date_for_merge', how='left')
+
+    # Календарные признаки
+    df_final['is_holiday'] = (df_final['day_type'] == 'non-working holiday').astype(int)
+    df_final['is_working_weekend'] = (df_final['day_type'] == 'working weekend').astype(int)
+    df_final['is_regular_weekend'] = (df_final['day_type'] == 'weekend').astype(int)
+    df_final['is_working_day'] = (df_final['day_type'] == 'working day').astype(int)
+    df_final['is_weekend_or_holiday'] = (
+        (df_final['day_type'] == 'weekend') | 
+        (df_final['day_type'] == 'non-working holiday')
+    ).astype(int)
+
+    # Временные признаки
+    df_final = df_final.sort_values('datetime')
+    df_final = create_lag_features(df_final)
+    df_final = create_rolling_features(df_final)
+    df_final = create_ewm_features(df_final)
+
+    initial_size = len(df_final)
+    df_final = df_final.dropna()
+    final_size = len(df_final)
+    print(f"Удалено строк с пропусками: {initial_size - final_size}")
+
+    # Удаляем временные колонки
+    columns_to_drop = ['date_for_merge_x', 'date_for_merge_y']
+    df_final = df_final.drop(columns=[col for col in columns_to_drop if col in df_final.columns])
+
+    df_final.to_csv(OUTPUT_FILE, index=False)
+    print(f"=== РАСШИРЕННАЯ ПРЕДОБРАБОТКА ЗАВЕРШЕНА ===")
+    print(f"Финальный датасет сохранен в {OUTPUT_FILE}")
+    print(f"Размер: {len(df_final)} строк, {len(df_final.columns)} колонок")
+    
+    # Выводим список всех признаков
+    print("\nСписок всех признаков:")
+    for i, col in enumerate(df_final.columns):
+        if col not in ['datetime', 'consumption', 'date_only']:
+            print(f"{i+1:3d}. {col}")
+
+if __name__ == "__main__":
+    main()
